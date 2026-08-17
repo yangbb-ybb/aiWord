@@ -1,0 +1,44 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+build/
+*.tsbuildinfo
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 日志
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# 运行时 / 缓存
+.DS_Store
+Thumbs.db
+.cache/
+.temp/
+tmp/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 覆盖率
+coverage/
+.nyc_output/
+
+# drizzle 迁移元数据（journal 仍需提交）
+end/src/db/migrations/meta/
+
+# 本地数据
+end/data/
+end/*.sqlite
+end/*.db

@@ -1,0 +1,209 @@
+import {
+  AlignmentType,
+  Document,
+  HeadingLevel,
+  Packer,
+  Paragraph,
+  TextRun
+} from 'docx'
+import MarkdownIt from 'markdown-it'
+
+const md = new MarkdownIt({ html: false, linkify: true, typographer: true })
+
+/**
+ * markdown-it token 序列 → docx Paragraph 数组。
+ * 支持：标题 H1-H4、段落（含粗体/斜体/行内代码/链接的简化保留为纯文本）、
+ *      有序/无序列表、引用、代码块、水平线。
+ *
+ * 表格、嵌套列表、图作为 TODO —— 阶段三继续覆盖。
+ */
+function tokensToParagraphs(
+  tokens: ReturnType<typeof md.parse>
+): Paragraph[] {
+  const paragraphs: Paragraph[] = []
+
+  let inCode = false
+  let codeBuf: string[] = []
+
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]
+
+    // ---------- 代码块 ----------
+    if (t.type === 'fence') {
+      if (!inCode) {
+        inCode = true
+        codeBuf = []
+      } else {
+        paragraphs.push(
+          new Paragraph({
+            spacing: { before: 120, after: 120 },
+            shading: { fill: 'F1F3F8' },
+            children: [
+              new TextRun({
+                text: codeBuf.join('\n'),
+                font: 'Consolas',
+                size: 20
+              })
+            ]
+          })
+        )
+        inCode = false
+        codeBuf = []
+      }
+      continue
+    }
+    if (inCode) {
+      codeBuf.push(t.content ?? '')
+      continue
+    }
+
+    // ---------- 标题 ----------
+    if (t.type === 'heading_open') {
+      const tag = (t as { tag?: string }).tag ?? 'h1'
+      const level = Number(tag.slice(1)) || 1
+      const inline = tokens[i + 1]
+      const text = inline?.type === 'inline' ? inline.content.trim() : ''
+      const hd =
+        level <= 1
+          ? HeadingLevel.HEADING_1
+          : level === 2
+          ? HeadingLevel.HEADING_2
+          : level === 3
+          ? HeadingLevel.HEADING_3
+          : HeadingLevel.HEADING_4
+      paragraphs.push(
+        new Paragraph({
+          heading: hd,
+          spacing: { before: 240, after: 120 },
+          children: [new TextRun({ text, bold: true })]
+        })
+      )
+      i += 2 // 跳过 inline + heading_close
+      continue
+    }
+
+    // ---------- 段落 ----------
+    if (t.type === 'paragraph_open') {
+      const inline = tokens[i + 1]
+      if (inline?.type === 'inline' && inline.content.trim()) {
+        paragraphs.push(
+          new Paragraph({
+            alignment: AlignmentType.JUSTIFIED,
+            spacing: { line: 360 }, // 1.5 倍行距
+            children: [new TextRun({ text: inline.content })]
+          })
+        )
+      }
+      i += 2 // 跳过 inline + paragraph_close
+      continue
+    }
+
+    // ---------- 列表 ----------
+    if (t.type === 'bullet_list_open' || t.type === 'ordered_list_open') {
+      const ordered = t.type === 'ordered_list_open'
+      let j = i + 1
+      let orderedIdx = 0
+      while (
+        j < tokens.length &&
+        tokens[j].type !== 'bullet_list_close' &&
+        tokens[j].type !== 'ordered_list_close'
+      ) {
+        if (tokens[j].type === 'list_item_open') {
+          let text = ''
+          if (tokens[j + 1]?.type === 'paragraph_open' && tokens[j + 2]) {
+            text = tokens[j + 2].content ?? ''
+          }
+          orderedIdx += 1
+          const prefix = ordered ? `${orderedIdx}. ` : '• '
+          paragraphs.push(
+            new Paragraph({
+              indent: { left: 360 },
+              children: [new TextRun({ text: prefix + text.trim() })]
+            })
+          )
+          // skip paragraph_open + inline + paragraph_close + list_item_close
+          j += 3
+          if (tokens[j]?.type === 'list_item_close') j += 1
+        } else {
+          j += 1
+        }
+      }
+      i = j
+      continue
+    }
+
+    // ---------- 引用 ----------
+    if (t.type === 'blockquote_open') {
+      let j = i + 1
+      const parts: string[] = []
+      while (
+        j < tokens.length &&
+        tokens[j].type !== 'blockquote_close'
+      ) {
+        if (tokens[j].type === 'inline') parts.push(tokens[j].content)
+        j += 1
+      }
+      paragraphs.push(
+        new Paragraph({
+          indent: { left: 720 },
+          border: {
+            left: { color: '4F46E5', space: 4, style: 'single', size: 12 }
+          },
+          spacing: { before: 120, after: 120 },
+          children: [
+            new TextRun({ text: parts.join(' ').trim(), italics: true })
+          ]
+        })
+      )
+      i = j
+      continue
+    }
+
+    // ---------- 水平线 ----------
+    if (t.type === 'hr') {
+      paragraphs.push(
+        new Paragraph({
+          alignment: AlignmentType.CENTER,
+          children: [new TextRun({ text: '———' })]
+        })
+      )
+      continue
+    }
+  }
+
+  return paragraphs
+}
+
+/**
+ * 公开方法：Markdown 字符串 → Buffer（.docx 二进制）
+ */
+export async function markdownToDocx(input: {
+  title: string
+  content: string
+}): Promise<Buffer> {
+  const tokens = md.parse(input.content ?? '', {})
+  const body = tokensToParagraphs(tokens)
+
+  const doc = new Document({
+    creator: 'aiWord',
+    title: input.title,
+    description: 'Generated by aiWord',
+    sections: [
+      {
+        properties: {},
+        children: [
+          new Paragraph({
+            alignment: AlignmentType.CENTER,
+            spacing: { after: 360 },
+            children: [
+              new TextRun({ text: input.title, bold: true, size: 36 })
+            ]
+          }),
+          ...body
+        ]
+      }
+    ]
+  })
+
+  return await Packer.toBuffer(doc)
+}
