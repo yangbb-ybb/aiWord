@@ -100,12 +100,13 @@ export default async function authRoutes(app: FastifyInstance) {
     const body = loginBody.parse(req.body)
     const user = await findUserByEmail(body.email)
     if (!user || !user.passwordHash) {
-      return reply.code(401).send(authError('INVALID_CREDENTIALS', '邮箱或密码错误'))
+      return reply.code(401).send({ code: 'INVALID_CREDENTIALS', message: '邮箱或密码错误' })
     }
     const ok = await verifyPassword(body.password, user.passwordHash)
     if (!ok) {
-      return reply.code(401).send(authError('INVALID_CREDENTIALS', '邮箱或密码错误'))
+      return reply.code(401).send({ code: 'INVALID_CREDENTIALS', message: '邮箱或密码错误' })
     }
+
     if (user.status !== 'active') {
       return reply.code(403).send({ code: 'USER_BANNED', message: '账号已被禁用' })
     }
@@ -119,20 +120,47 @@ export default async function authRoutes(app: FastifyInstance) {
   /** 发短信验证码 —— dev 阶段打日志，不接网关 */
   app.post('/sms/send', async (req, reply) => {
     const body = smsSendBody.parse(req.body)
-    await sendSmsCode(body.phone, body.purpose)
-    return reply.code(202).send({ ok: true, hint: 'dev: 看后端控制台' })
+    const { code, expiresAt, ttlMs } = await sendSmsCode(body.phone, body.purpose)
+    // 完整业务日志：phone / 验证码明文 / 用途 / 过期时间
+    req.log.info(
+      {
+        event: 'sms_code_sent',
+        phone: body.phone,
+        code,
+        purpose: body.purpose,
+        ttlMs,
+        expiresAt: expiresAt.toISOString(),
+        // dev 阶段模拟发送的"短信正文"
+        message: `【aiWord】您的验证码是 ${code}，${Math.round(ttlMs / 60000)} 分钟内有效。`
+      },
+      'sms code generated and queued (dev: not actually sent)'
+    )
+    return reply.code(202).send({ ok: true, hint: 'dev: 看后端日志文件' })
   })
 
   /** 手机号 + 验证码登录；不存在则自动注册 */
   app.post('/sms/login', async (req, reply) => {
     const body = smsLoginBody.parse(req.body)
-    const ok = await consumeSmsCode(body.phone, body.code, 'login')
-    if (!ok) {
+    const result = await consumeSmsCode(body.phone, body.code, 'login')
+    if (!result.ok) {
+      req.log.warn(
+        {
+          event: 'sms_login_failed',
+          phone: body.phone,
+          submittedCode: body.code,
+          purpose: 'login',
+          reason: result.reason
+        },
+        result.reason === 'EXPIRED'
+          ? 'sms login failed: code expired'
+          : 'sms login failed: code not found / mismatch / already used'
+      )
       return reply
         .code(400)
         .send({ code: 'SMS_INVALID', message: '验证码错误或已过期' })
     }
     let user = await findUserByPhone(body.phone)
+    let isNewUser = false
     if (!user) {
       // 自动注册：nickname 默认用手机号后 4 位
       user = await createUser({
@@ -140,14 +168,38 @@ export default async function authRoutes(app: FastifyInstance) {
         phone: body.phone,
         passwordHash: null
       })
+      isNewUser = true
     }
     if (user.status !== 'active') {
+      req.log.warn(
+        {
+          event: 'sms_login_banned',
+          phone: body.phone,
+          userId: user.id
+        },
+        'sms login blocked: user banned'
+      )
       return reply.code(403).send({ code: 'USER_BANNED', message: '账号已被禁用' })
     }
-    return {
-      user: toPublic(user),
+    const tokens = {
       accessToken: signAccessToken(user),
       refreshToken: await issueRefreshToken(user)
+    }
+    req.log.info(
+      {
+        event: 'sms_login_success',
+        phone: body.phone,
+        userId: user.id,
+        isNewUser,
+        nickname: user.nickname
+      },
+      isNewUser
+        ? 'sms login success: new user auto-registered'
+        : 'sms login success: existing user'
+    )
+    return {
+      user: toPublic(user),
+      ...tokens
     }
   })
 

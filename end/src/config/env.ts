@@ -41,7 +41,18 @@ const schema = z.object({
   // 微信开放平台 —— mock 阶段可不填；真实接入时填 AppID/Secret/回调
   WECHAT_APP_ID: z.string().optional(),
   WECHAT_APP_SECRET: z.string().optional(),
-  WECHAT_REDIRECT_URI: z.string().optional()
+  WECHAT_REDIRECT_URI: z.string().optional(),
+
+  // ---------------- 日志 ----------------
+  // 文件输出目录（按天切片：app-YYYY-MM-DD.log）
+  LOG_DIR: z.string().default('./logs'),
+  // 日志文件名（不含日期后缀和扩展名）
+  LOG_FILE: z.string().default('app'),
+  // dev 模式是否同时打一份到 stdout（带 pino-pretty 着色）
+  LOG_TO_CONSOLE: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true')
 })
 
 const parsed = schema.safeParse(process.env)

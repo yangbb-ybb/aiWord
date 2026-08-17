@@ -25,6 +25,10 @@ Thumbs.db
 .temp/
 tmp/
 
+# 日志目录（按天写文件：app-YYYY-MM-DD.log）
+logs/
+end/logs/
+
 # 编辑器
 .vscode/
 .idea/

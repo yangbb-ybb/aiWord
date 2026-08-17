@@ -8,6 +8,7 @@ import {
   type WechatQrSessionRow
 } from '~/db/schema'
 import { issueRefreshToken, signAccessToken, consumeSmsCode } from '~/services/auth'
+import { AppError } from './errors'
 import {
   createUser,
   findUserByOpenid,
@@ -118,8 +119,8 @@ export async function confirmMockLogin(input: ConfirmInput): Promise<ConfirmResu
       400
     )
   }
-  const ok = await consumeSmsCode(input.phone, input.smsCode, 'login')
-  if (!ok) {
+  const result = await consumeSmsCode(input.phone, input.smsCode, 'login')
+  if (!result.ok) {
     throw wechatError('SMS_INVALID', '验证码错误或已过期', 400)
   }
 
@@ -168,8 +169,8 @@ async function finalizeLogin(
 
 /** 已登录用户主动绑手机号（账号设置场景） */
 export async function bindPhoneForUser(userId: number, phone: string, smsCode: string) {
-  const ok = await consumeSmsCode(phone, smsCode, 'login')
-  if (!ok) {
+  const result = await consumeSmsCode(phone, smsCode, 'login')
+  if (!result.ok) {
     throw wechatError('SMS_INVALID', '验证码错误或已过期', 400)
   }
   await updateUser(userId, { phone })
@@ -178,13 +179,8 @@ export async function bindPhoneForUser(userId: number, phone: string, smsCode: s
 
 // ---------- error ----------
 
-export interface WechatErrorShape {
-  code: string
-  message: string
-  statusCode: number
-}
-export function wechatError(code: string, message: string, statusCode = 400): WechatErrorShape {
-  return { code, message, statusCode }
+export function wechatError(code: string, message: string, statusCode = 400): AppError {
+  return new AppError(code, message, statusCode)
 }
 
 // 抑制未使用警告

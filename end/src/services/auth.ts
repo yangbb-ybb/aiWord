@@ -5,6 +5,7 @@ import { and, eq, lt, isNull } from 'drizzle-orm'
 import { env } from '~/config/env'
 import { db } from '~/db'
 import { refreshTokens, smsCodes, users, type UserRow } from '~/db/schema'
+import { AppError } from './errors'
 
 /**
  * 简化的 ms 解析：支持 '5m' / '2h' / '30d'，够用即可。
@@ -179,23 +180,25 @@ function genSmsCode(): string {
 
 export async function sendSmsCode(phone: string, purpose: 'login' | 'register') {
   const code = genSmsCode()
-  const expiresAt = new Date(Date.now() + parseTtl(env.SMS_CODE_TTL))
+  const ttlMs = parseTtl(env.SMS_CODE_TTL)
+  const expiresAt = new Date(Date.now() + ttlMs)
   await db.insert(smsCodes).values({ phone, code, purpose, expiresAt })
-  // dev 阶段不入短信网关，直接打到日志
-  // eslint-disable-next-line no-console
-  console.log(`[SMS] phone=${phone} code=${code} purpose=${purpose}`)
-  return { expiresAt }
+  // 不再 console.log —— 路由层用 req.log.info 写一条带 reqId / phone / code / purpose / ttl 的完整日志
+  return { code, expiresAt, ttlMs }
 }
 
+export type ConsumeSmsResult =
+  | { ok: true }
+  | { ok: false; reason: 'NOT_FOUND' | 'EXPIRED' }
+
 /**
- * 校验短信码并标记为已用。如果校验通过，返回 true；
- * 不存在 /不匹配 /已用过 /已过期 都返回 false（路由层转 400）。
+ * 校验短信码并标记为已用。返回 ok + 失败原因，路由层据此写日志 + 转 HTTP code。
  */
 export async function consumeSmsCode(
   phone: string,
   code: string,
   purpose: 'login' | 'register'
-): Promise<boolean> {
+): Promise<ConsumeSmsResult> {
   const rows = await db
     .select()
     .from(smsCodes)
@@ -209,10 +212,10 @@ export async function consumeSmsCode(
     )
     .limit(1)
   const row = rows[0]
-  if (!row) return false
-  if (row.expiresAt.getTime() < Date.now()) return false
+  if (!row) return { ok: false, reason: 'NOT_FOUND' }
+  if (row.expiresAt.getTime() < Date.now()) return { ok: false, reason: 'EXPIRED' }
   await db.update(smsCodes).set({ used: true }).where(eq(smsCodes.id, row.id))
-  return true
+  return { ok: true }
 }
 
 /** 清理过期验证码 / refresh token —— 定时任务或路由里偶尔调用 */
@@ -226,11 +229,7 @@ export async function purgeExpired() {
 
 // ---------- error ----------
 
-export interface AuthErrorShape {
-  code: string
-  message: string
-  statusCode: number
-}
-export function authError(code: string, message: string): AuthErrorShape {
-  return { code, message, statusCode: 401 }
+/** 构造一个 401 业务错误，供 service 内部 throw */
+export function authError(code: string, message: string): AppError {
+  return new AppError(code, message, 401)
 }

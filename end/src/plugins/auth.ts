@@ -56,6 +56,9 @@ export async function registerAuthPlugin(app: FastifyInstance) {
       }
       req.user = toPublic(user)
       req.tokenPayload = payload
+      // 校验通过后，把 userId 挂到 req.log 的 child 上，
+      // 后续"request completed"日志里就会自动带上 userId
+      req.log = req.log.child({ userId: req.user.id })
     }
   )
 }
