@@ -38,10 +38,11 @@ export interface GenerateInput {
   /** 已存在的正文（完整 Markdown） */
   contextText?: string
   /**
-   * 对话历史：[{role: 'user' | 'assistant', content: string}, ...]
+   * 对话历史：[{role: 'user' | 'assistant', content: string, kind?}, ...]
    * AI 通过它"记住"之前几轮做了什么，避免每次都从零续写
+   * content 在 chat/analyze 类消息里是 AI 的回复；在 edit 类消息里是 AI 的"完整新文档"
    */
-  history?: Array<{ role: 'user' | 'assistant'; content: string }>
+  history?: Array<{ role: 'user' | 'assistant'; content: string; kind?: 'edit' | 'analyze' | 'chat' }>
 }
 
 export interface RewriteInput {
@@ -73,12 +74,34 @@ function buildSystem(opts: {
   const length = lengthToText(opts.length ?? 50)
   const lang = LANG_DESC[opts.language ?? 'zh']
   return [
-    '你是 aiWord 的写作助手，用户正编辑一份 Markdown 文档。',
+    '你是 aiWord 的写作助手，同时也是用户的对话伙伴。',
+    '用户正编辑一份 Markdown 文档，但对话中也会包含闲聊、评价、问答等与文档无关的内容。',
     `风格：${tone}`,
     `长度：${length}`,
     `语言：${lang}`,
-    '输出格式：合法 Markdown，可直接被渲染。遇到标题/列表/代码请正确使用语法。',
-    '不要解释、不要寒暄，直接产出内容。'
+    '',
+    '## 你的回复必须严格遵守下面的格式',
+    '第一步：从用户最新一句判断意图，**三种之一**：',
+    '  A. [INTENT:edit]   — 用户希望直接修改文档（缩短/扩写/润色/加章节/修语法/改某段 等明确指令）',
+    '  B. [INTENT:analyze] — 用户希望**听取**评价/建议/分析，但**不动文档**（"这段怎么样"/"起个更好的标题"/"看看哪里需要改进"）',
+    '  C. [INTENT:chat]   — 闲聊/问候/知识问答/反问澄清/与文档无关的话题',
+    '',
+    '第二步：根据意图输出**仅且只能**以下三种开头之一：',
+    '  - [INTENT:edit]    → 紧跟其后输出"完整的新文档 Markdown"，不含围栏、不含前后解释',
+    '  - [INTENT:analyze] → 紧跟其后输出你的评价/建议，可用 Markdown；**禁止直接修改文档**，不要输出完整新文档',
+    '  - [INTENT:chat]    → 紧跟其后输出你的答复，可用 Markdown 排版',
+    '',
+    '## 判断指引（拿不准时，优先 [INTENT:chat]，绝不乱动文档）',
+    '- "缩短/扩写/加一句/删掉这段/把 X 改成 Y/总结为 200 字" 等**明确动作** → [INTENT:edit]',
+    '- "这段怎么样/看看哪里要改/给点建议/有什么问题/起个更好的标题" → [INTENT:analyze]',
+    '- "你好/你是谁/讲个笑话/推荐/解释下…/今天天气" → [INTENT:chat]',
+    '- **模糊**（如"开头有点长"/"感觉不太通顺"/"能优化吗"）→ [INTENT:chat] 反问一句："你想让我直接改，还是先给点建议？"',
+    '- 即使是问问题，只要问题是"这份文档怎么改" → [INTENT:analyze]（给建议）',
+    '',
+    '## 强约束',
+    '- 标记必须出现在第一行最前面，整份回复只能用一次',
+    '- 不要输出 ```json``` 围栏；不要在标记前加任何解释、寒暄、emoji；不要输出"好的，我来…"',
+    '- [INTENT:analyze] 时若想顺手把改完的版本也展示出来，**用 Markdown 代码块包住**（"下面是按建议改完的版本，仅供参考"），让前端识别为参考、不会误判为要替换的全文'
   ].join('\n')
 }
 
@@ -116,29 +139,21 @@ export async function runGenerate(
     language: input.language
   })
 
-  // 关键 prompt：让 AI 每次都返回"完整新文档"，而不是片段
-  // 这样前端拿到结果后直接替换 doc.content，不会越堆越长
+  // 用户消息：把当前文档内容 + 用户指令一起交给 AI，
+  // 让 AI 自己判断：是要改文档（[INTENT:edit]），还是只是在聊天（[INTENT:chat]）。
   const userText = input.contextText
-    ? `以下是当前文档的完整 Markdown 内容：
+    ? `以下是当前文档的完整 Markdown 内容（用于"修改文档"类请求时参考；闲聊类请求可忽略）：
 
 \`\`\`markdown
 ${input.contextText}
 \`\`\`
 
-用户当前的指令：${input.prompt || '请基于以上内容继续完善'}
-
-要求：
-1. 严格按照用户指令对文档做整体性修改（缩短/扩写/润色/加结论/修语法 等）
-2. 返回的是**完整的新文档**（Markdown 全文），不是片段、不是 diff、不是追加
-3. 不要解释、不要寒暄、不要输出 \`\`\`markdown\`\`\` 围栏，直接给正文
-4. 如果用户指令与文档内容无关（如"写个新章节"），把新内容合理插入到合适位置，并保留原文档其余部分`
-    : `用户指令：${input.prompt || '请自由发挥，写一篇 Markdown 文章'}
-
-要求：
-1. 返回完整的 Markdown 文档全文
-2. 不要解释、不要寒暄、不要围栏`
+用户当前的指令：${input.prompt || '请基于以上内容继续完善'}`
+    : `用户指令：${input.prompt || '请自由发挥，写一篇 Markdown 文章'}`
 
   // 组装消息：历史 + 当前指令
+  // 历史里 kind==='edit' 的 assistant content 是"完整新文档"；kind==='chat' 是"AI 的回复"
+  // 把它们都喂回去，让 AI 维持上下文（连续多轮对话不会失忆）
   const messages: Message[] = []
   if (input.history?.length) {
     for (const m of input.history) {

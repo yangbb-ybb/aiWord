@@ -36,9 +36,44 @@ export interface GenerateOptions {
   language?: string
   /** 已存在的正文，传过去用于续写 */
   contextText?: string
-  /** 对话历史（前端维护）：[{role, content}] */
-  history?: Array<{ role: 'user' | 'assistant'; content: string }>
+  /** 对话历史（前端维护）：[{role, content, kind?}] */
+  history?: Array<{ role: 'user' | 'assistant'; content: string; kind?: 'edit' | 'analyze' | 'chat' }>
+  /**
+   * 强制指定意图，跳过 AI 自主分流：
+   * - 'edit'    → 直接进入 pendingDiff 流程
+   * - 'analyze' → 直接追加到 chatThread 作为建议
+   * - 'chat'    → 直接追加到 chatThread 作为聊天
+   * 不传则交给 AI 自己判断（推荐）
+   */
+  forceMode?: AiIntent
 }
+
+/**
+ * AI 对话面板里的一条消息：
+ * - role='user' 永远是用户输入
+ * - role='assistant' 时：
+ *   - kind='edit'    → AI 改了文档（内容是"完整新文档"），右侧只显示摘要 + "查看改动"链接
+ *   - kind='analyze' → AI 给了评价/建议（不动文档），右侧渲染 + 提供"应用到文档"按钮
+ *   - kind='chat'    → AI 闲聊/问答/反问澄清，直接渲染
+ */
+export interface ChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  kind?: 'edit' | 'analyze' | 'chat'
+  /** 毫秒时间戳，用于 UI 排序/格式化 */
+  ts: number
+}
+
+/**
+ * AI 智能体分流：识别后端返回的第一行标签
+ * - edit：AI 决定改文档，accumulated 是"完整新文档"
+ * - analyze：AI 决定给建议/评价，accumulated 是建议正文（不动文档）
+ * - chat：AI 决定不改动文档，accumulated 是"聊天回复"
+ */
+export type AiIntent = 'edit' | 'analyze' | 'chat'
+
+const INTENT_RE = /^\s*\[INTENT:(edit|analyze|chat)\]\s*/i
 
 /** 平台显示元数据，供左/右栏复用 */
 export const PLATFORMS: { key: Platform; label: string; color: string }[] = [
@@ -261,11 +296,22 @@ export const useDocumentStore = defineStore('document', () => {
   /**
    * 每篇文档独立的"AI 对话历史"：让 AI 记住之前几轮做过什么，
    * 避免每次都从零开始、也不重复堆内容。
-   * Map<docId, Array<{role, content}>>
+   * - 喂回后端的内容：[{role, content, kind}]
+   *   - kind='edit' → AI 之前给出过"完整新文档"
+   *   - kind='chat' → AI 之前的聊天回复
    */
-  const chatHistory = ref<Map<string, Array<{ role: 'user' | 'assistant'; content: string }>>>(
-    new Map()
-  )
+  const chatHistory = ref<
+    Map<string, Array<{ role: 'user' | 'assistant'; content: string; kind?: 'edit' | 'chat' }>>
+  >(new Map())
+
+  /**
+   * 右栏"AI 对话"面板里展示的消息流，按文档隔离。
+   * - user 消息：每次 generate() 都新增一条
+   * - assistant 消息：
+   *   - chat 类：generate() 流式完成后立即追加
+   *   - edit 类：等用户"接受"后才追加（拒绝则丢弃，让用户感觉这一轮白聊了）
+   */
+  const chatThread = ref<Map<string, ChatMessage[]>>(new Map())
   /**
    * AI 生成的"待确认改动"：流式完成后不会立刻落库，先存到这里。
    * 用户点接受才真正写入 doc.content + 持久化 + 加入聊天历史。
@@ -285,13 +331,20 @@ export const useDocumentStore = defineStore('document', () => {
   } | null>(null)
   /**
    * AI 正在流式生成时的"实时预览"：让用户看到 AI 在一步步输出内容，
-   * 避免等待的焦虑感。流式完成后会被 pendingDiff 接管。
+   * 避免等待的焦虑感。流式完成后会被 pendingDiff 或 chatThread 接管。
+   * - mode='edit' → accumulated 是"完整新文档"，走 diff 流程
+   * - mode='chat' → accumulated 是"AI 聊天回复"，走对话流程
+   * - mode=null   → AI 还没表态，先显示"AI 正在思考"
    */
   const streamingPreview = ref<{
     docId: string
     preContent: string
-    /** AI 实时累积的输出片段 */
+    /** 去掉 [INTENT:xxx] 标签后的累积内容 */
     accumulated: string
+    /** 后端原始输出（含标签），用于排查 AI 没打标的情况 */
+    rawBuffer: string
+    /** AI 自己分流后的意图，未识别前为 null */
+    mode: AiIntent | null
     /** 用户这一轮的指令（标题区展示） */
     prompt: string
   } | null>(null)
@@ -393,14 +446,19 @@ export const useDocumentStore = defineStore('document', () => {
 
   /**
    * 一键生成：POST /api/ai/generate（SSE）。
-   * - AI 收到对话历史 + 当前文档，每次返回**完整新文档**
-   * - 流式过程：accumulated 缓冲每个 chunk 更新（不直接改 doc.content）
-   * - 流式完成后：**不立刻落库**，而是把 pre/post 内容 + 行级 diff 放进 pendingDiff
-   *   等用户在 UI 上点"接受"才真正写入 doc.content、持久化、加历史
-   * - 用户可以点"拒绝"丢弃 AI 改动
+   * - AI 收到对话历史 + 当前文档，**自己判断**是要改文档（[INTENT:edit]）还是只是问答（[INTENT:chat]）
+   * - 流式过程：先 buffer，等待意图标签出现；标签一出现立刻分流到不同 UI
+   *   - edit：进入 pendingDiff 走"接受/拒绝"流程（保留 doc.content）
+   *   - chat：直接追加到 chatThread，给用户聊天气泡
+   * - 意图识别失败的兜底：按 edit 走（兼容老行为）
+   *
+   * 返回 { content, mode }：mode 给调用方做后续 UI 提示（如 toast）用，
+   * 因为生成结束后 streamingPreview 已被清空，外部已无法再读到 mode。
    */
-  async function generate(opts: GenerateOptions): Promise<string> {
-    if (!current.value) return ''
+  async function generate(
+    opts: GenerateOptions
+  ): Promise<{ content: string; mode: AiIntent }> {
+    if (!current.value) return { content: '', mode: 'chat' }
     const doc = current.value
     const baseContent = doc.content ?? ''
     isGenerating.value = true
@@ -408,15 +466,39 @@ export const useDocumentStore = defineStore('document', () => {
     // 拿这篇文档专属的历史；没有就空
     const history = chatHistory.value.get(doc.id) ?? []
 
-    // 流式过程累积的"AI 输出全文"
-    let accumulated = ''
+    // 流式缓冲：rawBuffer 是后端原始字节（含标签），
+    // contentBuffer 是去掉 [INTENT:xxx] 后真正展示/处理的内容
+    let rawBuffer = ''
+    let contentBuffer = ''
+    let detected: AiIntent | null = null
 
-    // 打开"实时预览"，让用户在等待中看到 AI 一段段输出
+    // 打开"实时预览"，先以未识别状态启动
     streamingPreview.value = {
       docId: doc.id,
       preContent: baseContent,
       accumulated: '',
+      rawBuffer: '',
+      mode: null,
       prompt: opts.prompt ?? ''
+    }
+
+    // 从一段文本里识别 [INTENT:edit] / [INTENT:chat]；识别到就剥掉前缀
+    function matchIntent(text: string): { intent: AiIntent | null; rest: string } {
+      const m = text.match(INTENT_RE)
+      if (!m) return { intent: null, rest: text }
+      const intent = m[1].toLowerCase() as AiIntent
+      return { intent, rest: text.slice(m[0].length) }
+    }
+
+    // 更新 streamingPreview（一次性塞新对象，触发响应式）
+    function pushPreview() {
+      if (!streamingPreview.value) return
+      streamingPreview.value = {
+        ...streamingPreview.value,
+        accumulated: contentBuffer,
+        rawBuffer,
+        mode: detected
+      }
     }
 
     try {
@@ -434,35 +516,98 @@ export const useDocumentStore = defineStore('document', () => {
         },
         {
           onDelta(delta) {
-            accumulated += delta
-            // 同步到 streamingPreview 给 UI 实时渲染
-            if (streamingPreview.value && streamingPreview.value.docId === doc.id) {
-              // 用替换触发响应式（accumulated 是 ref，赋值会触发更新）
-              streamingPreview.value = {
-                ...streamingPreview.value,
-                accumulated
+            rawBuffer += delta
+            if (detected === null) {
+              // 还在等标签；命中后切到对应 UI
+              const { intent, rest } = matchIntent(rawBuffer)
+              if (intent) {
+                detected = intent
+                contentBuffer = rest
+                pushPreview()
+                return
               }
+              // 没命中标签前不渲染正文（避免把 "[INTENT:edit]" 闪给用户看）
+              pushPreview()
+            } else {
+              // 已分流：本轮 chunk 全是正文
+              contentBuffer += delta
+              pushPreview()
             }
           }
         }
       )
-      if (fullText) accumulated = fullText
+      if (fullText) {
+        // 用最终全文重算（兼容后端在 done 事件里给到的最终字符串）
+        rawBuffer = fullText
+        if (detected === null) {
+          const { intent, rest } = matchIntent(rawBuffer)
+          if (intent) {
+            detected = intent
+            contentBuffer = rest
+          } else {
+            // 兜底：完全没标签视为 edit（老行为）
+            detected = 'edit'
+            contentBuffer = rawBuffer
+          }
+        }
+        pushPreview()
+      }
 
-      // 计算行级 diff —— 给 UI 展示"AI 改了哪些行"
-      // {value: string, added?: true, removed?: true}
-      const diffParts = diffLines(baseContent, accumulated)
+      // user 消息：进入 chatThread（编辑和聊天模式都展示，让用户看到自己刚才说了啥）
+      const userMsg: ChatMessage = {
+        id: `u-${Date.now()}`,
+        role: 'user',
+        content: opts.prompt ?? '',
+        ts: Date.now()
+      }
+      const userThread = [...(chatThread.value.get(doc.id) ?? []), userMsg]
 
-      // 关掉实时预览，交接给 pendingDiff 等用户审阅
+      if (detected === 'chat') {
+        // ============ 聊天模式：直接追加 AI 消息，不动文档 ============
+        const aiMsg: ChatMessage = {
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          content: contentBuffer,
+          kind: 'chat',
+          ts: Date.now()
+        }
+        const next = new Map(chatThread.value)
+        next.set(doc.id, [...userThread, aiMsg])
+        chatThread.value = next
+
+        // 同时进 chatHistory（喂回 AI 用），区分 kind='chat'
+        const histNext = new Map(chatHistory.value)
+        const histList = [...(histNext.get(doc.id) ?? [])]
+        histList.push({ role: 'user', content: userMsg.content })
+        histList.push({ role: 'assistant', content: contentBuffer, kind: 'chat' })
+        histNext.set(doc.id, histList.slice(-20))
+        chatHistory.value = histNext
+
+        streamingPreview.value = null
+        return { content: contentBuffer, mode: 'chat' }
+      }
+
+      // ============ 编辑模式：进入 pendingDiff 等用户接受/拒绝 ============
+      // 计算行级 diff，给 UI 展示"AI 改了哪些行"
+      const postContent =
+        detected === 'edit' ? contentBuffer : contentBuffer || rawBuffer
+      const diffParts = diffLines(baseContent, postContent)
+
       streamingPreview.value = null
       pendingDiff.value = {
         docId: doc.id,
         preContent: baseContent,
-        postContent: accumulated,
+        postContent,
         diffParts,
         prompt: opts.prompt ?? ''
       }
 
-      return accumulated
+      // 注意：edit 模式下 user/AI 消息现在不进 chatThread，等用户点"接受"再追加
+      // 拒绝则整个这一轮都没发生过；这样符合用户对"接受/拒绝"操作的心智模型
+      // 但 user 消息可以单独先展示（只是让他看到自己刚才问的啥）—— 这里选择不展示，更纯粹
+      void userThread
+
+      return { content: postContent, mode: 'edit' }
     } catch (err) {
       // 出错时也清掉实时预览，避免残留
       streamingPreview.value = null
@@ -476,7 +621,7 @@ export const useDocumentStore = defineStore('document', () => {
   /**
    * 接受 AI 改动：
    * - 把 postContent 写入 doc.content，触发防抖保存
-   * - 把 user prompt + AI 输出加入聊天历史
+   * - 把 user prompt + AI 输出加入聊天历史（chatHistory 用于 AI 记忆；chatThread 用于右栏展示）
    * - 清掉 pendingDiff
    */
   function acceptPendingDiff(): boolean {
@@ -490,12 +635,32 @@ export const useDocumentStore = defineStore('document', () => {
     }
     updateContent(pd.docId, pd.postContent)
 
-    const next = new Map(chatHistory.value)
-    const list = [...(next.get(pd.docId) ?? [])]
-    list.push({ role: 'user', content: pd.prompt })
-    list.push({ role: 'assistant', content: pd.postContent })
-    next.set(pd.docId, list.slice(-20))
-    chatHistory.value = next
+    // chatHistory：喂回 AI 用，标记 kind='edit'
+    const histNext = new Map(chatHistory.value)
+    const histList = [...(histNext.get(pd.docId) ?? [])]
+    histList.push({ role: 'user', content: pd.prompt })
+    histList.push({ role: 'assistant', content: pd.postContent, kind: 'edit' })
+    histNext.set(pd.docId, histList.slice(-20))
+    chatHistory.value = histNext
+
+    // chatThread：右栏展示，编辑消息渲染为"已修改 [+N -M]"而不是全文
+    const threadNext = new Map(chatThread.value)
+    const threadList = [...(threadNext.get(pd.docId) ?? [])]
+    threadList.push({
+      id: `u-${Date.now()}`,
+      role: 'user',
+      content: pd.prompt,
+      ts: Date.now()
+    })
+    threadList.push({
+      id: `a-${Date.now()}`,
+      role: 'assistant',
+      content: pd.postContent,
+      kind: 'edit',
+      ts: Date.now()
+    })
+    threadNext.set(pd.docId, threadList)
+    chatThread.value = threadNext
 
     pendingDiff.value = null
     streamingPreview.value = null
@@ -505,7 +670,7 @@ export const useDocumentStore = defineStore('document', () => {
   /**
    * 拒绝 AI 改动：
    * - 文档保持 preContent 不变
-   * - 也不加入对话历史（相当于这一轮白聊了）
+   * - 不入 chatHistory / chatThread（相当于这一轮白聊了，符合用户预期）
    */
   function rejectPendingDiff(): boolean {
     if (!pendingDiff.value) return false
@@ -530,14 +695,24 @@ export const useDocumentStore = defineStore('document', () => {
     return { added, removed, total }
   })
 
-  /** 清掉某文档的 AI 对话历史（例如"重新开始"按钮） */
+  /** 清掉某文档的 AI 对话历史与右栏对话流（例如"重新开始"按钮） */
   function clearChatHistory(docId?: string) {
     const id = docId ?? current.value?.id
     if (!id) return
-    if (!chatHistory.value.has(id)) return
-    const next = new Map(chatHistory.value)
-    next.delete(id)
-    chatHistory.value = next
+    let changed = false
+    if (chatHistory.value.has(id)) {
+      const next = new Map(chatHistory.value)
+      next.delete(id)
+      chatHistory.value = next
+      changed = true
+    }
+    if (chatThread.value.has(id)) {
+      const next = new Map(chatThread.value)
+      next.delete(id)
+      chatThread.value = next
+      changed = true
+    }
+    return changed
   }
 
   return {
@@ -551,6 +726,7 @@ export const useDocumentStore = defineStore('document', () => {
     savingIds,
     lastSavedAt,
     chatHistory,
+    chatThread,
     streamingPreview,
     pendingDiff,
     pendingDiffSummary,

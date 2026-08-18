@@ -40,6 +40,33 @@ const currentContent = computed(() => store.current?.content ?? '')
 
 const rendered = computed(() => md.render(currentContent.value))
 
+/**
+ * 把 store 里的 diffParts 摊平成"按行"渲染的视图：
+ * - kind: 'add' | '删除' | '不变'（ctx）
+ * - text: 单行内容（不含 \n）
+ * diffLines 的 value 形如 "old\nnew\n"，需要按 \n 拆开每一行。
+ */
+const diffLinesView = computed<
+  Array<{ kind: 'add' | 'del' | 'ctx'; text: string }>
+>(() => {
+  const parts = store.pendingDiff?.diffParts
+  if (!parts) return []
+  const out: Array<{ kind: 'add' | 'del' | 'ctx'; text: string }> = []
+  for (const part of parts) {
+    // diff 库返回的 value 通常以 \n 结尾；空字符串需要跳过
+    const lines = part.value.split('\n')
+    // 如果末尾是 \n，split 会留下空字符串——去掉
+    if (lines.length && lines[lines.length - 1] === '') lines.pop()
+    const kind: 'add' | 'del' | 'ctx' = part.added
+      ? 'add'
+      : part.removed
+      ? 'del'
+      : 'ctx'
+    for (const line of lines) out.push({ kind, text: line })
+  }
+  return out
+})
+
 /** 保存状态指示：idle / saving / saved */
 const saveStatus = computed<'idle' | 'saving' | 'saved'>(() => {
   const id = store.current?.id
@@ -122,6 +149,40 @@ function rejectDiff() {
   store.rejectPendingDiff()
   ElMessage.info('已丢弃 AI 改动')
 }
+
+/**
+ * 流式面板 + diff 视图：让滚动条自动跟着新内容走到底部。
+ * 规则：
+ * - 内容更新后，自动滚到底（nextTick 等 DOM 更新）
+ * - 如果用户手动往上滚了（不在底部 50px 范围内），就不再强制拉，保留他的视口位置
+ * - 用户重新滚到底后，下次更新又恢复自动跟随
+ */
+const streamBodyRef = ref<HTMLElement | null>(null)
+const diffBodyRef = ref<HTMLElement | null>(null)
+
+function stickToBottom(el: HTMLElement | null) {
+  if (!el) return
+  const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+  // 用户距离底部 <= 50px，认为是"想看最新"，继续贴底
+  if (distanceToBottom <= 50) {
+    el.scrollTop = el.scrollHeight
+  }
+}
+
+watch(
+  () => store.streamingPreview?.accumulated,
+  () => {
+    nextTick(() => stickToBottom(streamBodyRef.value))
+  }
+)
+
+watch(
+  () => store.pendingDiff?.diffParts,
+  () => {
+    nextTick(() => stickToBottom(diffBodyRef.value))
+  },
+  { deep: true }
+)
 
 watch(
   () => store.currentId,
@@ -210,74 +271,81 @@ watch(
         </div>
       </div>
 
-      <!-- AI 实时打字预览：流式生成时显示，让用户看到 AI 在输出 -->
-      <div v-if="store.streamingPreview" class="ai-stream-panel">
+      <!-- AI 实时打字预览：仅在"修改文档"模式下显示，让用户看到 AI 在写正文。
+           闲聊/问答模式下，AI 的回复已经在右栏聊天气泡里流式呈现，这里不重复展示。 -->
+      <div
+        v-if="store.streamingPreview && store.streamingPreview.mode !== 'chat'"
+        class="ai-stream-panel"
+      >
         <header class="ai-stream-panel__head">
           <div class="ai-stream-panel__title">
             <span class="ai-stream-panel__dot" />
-            <span>AI 正在创作…</span>
+            <span>
+              {{
+                store.streamingPreview.mode === 'edit'
+                  ? 'AI 正在改文档…'
+                  : 'AI 正在思考…'
+              }}
+            </span>
             <em class="ai-stream-panel__prompt">{{ store.streamingPreview.prompt }}</em>
           </div>
           <span class="ai-stream-panel__counter">
             {{ store.streamingPreview.accumulated.length }} 字
           </span>
         </header>
-        <div class="ai-stream-panel__body">
+        <div ref="streamBodyRef" class="ai-stream-panel__body">
           <pre class="ai-stream-panel__text">{{ store.streamingPreview.accumulated }}<span class="caret" /></pre>
         </div>
       </div>
 
-      <!-- AI 改动预览：有 pendingDiff 时显示，编辑区临时禁用 -->
-      <div v-else-if="store.pendingDiff" class="ai-diff-panel">
-        <header class="ai-diff-panel__head">
-          <div class="ai-diff-panel__title">
-            <el-icon><MagicStick /></el-icon>
-            <span>AI 提议的改动</span>
-            <em class="ai-diff-panel__stats">
-              <span class="diff-stat diff-stat--add">+{{ store.pendingDiffSummary.added }}</span>
-              <span class="diff-stat diff-stat--del">-{{ store.pendingDiffSummary.removed }}</span>
-            </em>
-          </div>
-          <div class="ai-diff-panel__actions">
-            <button class="diff-btn diff-btn--ghost" @click="rejectDiff">
-              <el-icon><CircleClose /></el-icon>
-              <span>拒绝</span>
-            </button>
-            <button class="diff-btn diff-btn--primary" @click="acceptDiff">
-              <el-icon><Check /></el-icon>
-              <span>接受</span>
-            </button>
-          </div>
-        </header>
-
-        <div class="ai-diff-panel__body">
-          <div
-            v-for="(part, i) in store.pendingDiff.diffParts"
-            :key="i"
-            class="diff-part"
-            :class="{
-              'diff-part--add': part.added,
-              'diff-part--del': part.removed
-            }"
-          >
-            <span
-              v-for="(line, j) in part.value.split('\n').filter(Boolean)"
-              :key="j"
-              class="diff-line"
-            >
-              <span class="diff-line__sign">
-                {{ part.added ? '+' : part.removed ? '−' : ' ' }}
-              </span>
-              <span class="diff-line__text">{{ line }}</span>
-            </span>
-          </div>
+      <!-- AI 改动顶部操作条：接受/拒绝 + 统计；diff 主体在 ce-body 渲染 -->
+      <div v-else-if="store.pendingDiff" class="ai-diff-bar">
+        <div class="ai-diff-bar__title">
+          <el-icon><MagicStick /></el-icon>
+          <span>AI 提议的改动</span>
+          <em class="ai-diff-bar__stats">
+            <span class="diff-stat diff-stat--add">+{{ store.pendingDiffSummary.added }}</span>
+            <span class="diff-stat diff-stat--del">-{{ store.pendingDiffSummary.removed }}</span>
+          </em>
+        </div>
+        <div class="ai-diff-bar__actions">
+          <button class="diff-btn diff-btn--ghost" @click="rejectDiff">
+            <el-icon><CircleClose /></el-icon>
+            <span>拒绝</span>
+          </button>
+          <button class="diff-btn diff-btn--primary" @click="acceptDiff">
+            <el-icon><Check /></el-icon>
+            <span>接受</span>
+          </button>
         </div>
       </div>
 
-      <div class="ce-body">
-        <div class="ce-paper" :key="store.currentId">
+      <div ref="diffBodyRef" class="ce-body">
+        <div class="ce-paper" :key="store.currentId ?? 'empty'">
+          <!-- AI diff 视图：直接把差异画在编辑器里（替换 textarea） -->
+          <div
+            v-if="store.pendingDiff"
+            class="ce-diff-editor"
+          >
+            <div
+              v-for="(line, i) in diffLinesView"
+              :key="i"
+              class="ce-diff-row"
+              :class="{
+                'ce-diff-row--add': line.kind === 'add',
+                'ce-diff-row--del': line.kind === 'del',
+                'ce-diff-row--ctx': line.kind === 'ctx'
+              }"
+            >
+              <span class="ce-diff-row__sign">
+                {{ line.kind === 'add' ? '+' : line.kind === 'del' ? '−' : '' }}
+              </span>
+              <span class="ce-diff-row__text">{{ line.text }}</span>
+            </div>
+          </div>
+
           <textarea
-            v-if="activeTab === 'edit'"
+            v-else-if="activeTab === 'edit'"
             id="editor-textarea"
             class="ce-textarea"
             :value="currentContent"
@@ -384,32 +452,22 @@ watch(
   background: #10b981;
 }
 
-/* ---------- AI diff 预览面板 ---------- */
-.ai-diff-panel {
-  display: flex;
-  flex-direction: column;
-  max-height: 50vh;
-  border-bottom: 1px solid var(--border-soft);
-  background: linear-gradient(
-    180deg,
-    rgba(99, 102, 241, 0.04) 0%,
-    var(--bg-card) 100%
-  );
-  animation: slideDown 0.25s ease;
-}
-.ai-diff-panel__head {
+/* ---------- AI diff 顶部操作条（紧凑版） ---------- */
+.ai-diff-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
   padding: var(--space-3) var(--space-6);
-  border-bottom: 1px dashed var(--border-soft);
-  background: var(--bg-card);
-  position: sticky;
-  top: 0;
-  z-index: 1;
+  border-bottom: 1px solid var(--border-soft);
+  background: linear-gradient(
+    180deg,
+    rgba(99, 102, 241, 0.06) 0%,
+    var(--bg-card) 100%
+  );
+  animation: slideDown 0.25s ease;
 }
-.ai-diff-panel__title {
+.ai-diff-bar__title {
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -417,15 +475,19 @@ watch(
   font-weight: 600;
   color: var(--text-primary);
 }
-.ai-diff-panel__title .el-icon {
+.ai-diff-bar__title .el-icon {
   color: var(--color-brand);
   font-size: 16px;
 }
-.ai-diff-panel__stats {
+.ai-diff-bar__stats {
   font-style: normal;
   display: inline-flex;
   gap: 6px;
   margin-left: 4px;
+}
+.ai-diff-bar__actions {
+  display: inline-flex;
+  gap: var(--space-2);
 }
 .diff-stat {
   font-size: 11px;
@@ -721,6 +783,62 @@ watch(
   box-shadow: var(--shadow-md);
   overflow: hidden;
   animation: fadeIn 0.2s ease;
+}
+
+/* AI diff 视图（替代 textarea）：按行渲染，绿色新增 / 红色删除 / 不变 */
+.ce-diff-editor {
+  width: 100%;
+  min-height: calc(100vh - 240px);
+  padding: var(--space-6) var(--space-8);
+  font-family: 'Menlo', 'Consolas', 'Monaco', monospace;
+  font-size: 14.5px;
+  line-height: 1.8;
+  color: var(--text-primary);
+  background: transparent;
+}
+.ce-diff-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 0 8px;
+  margin: 0 -8px;
+  border-radius: 4px;
+  min-height: 1.8em;
+}
+.ce-diff-row--add {
+  background: rgba(16, 185, 129, 0.12);
+  border-left: 3px solid #10b981;
+  color: #065f46;
+}
+.ce-diff-row--del {
+  background: rgba(239, 68, 68, 0.08);
+  border-left: 3px solid #ef4444;
+  color: #991b1b;
+  text-decoration: line-through;
+  text-decoration-color: rgba(239, 68, 68, 0.4);
+  opacity: 0.9;
+}
+.ce-diff-row--ctx {
+  color: var(--text-secondary);
+}
+.ce-diff-row__sign {
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+  font-weight: 700;
+  user-select: none;
+}
+.ce-diff-row--add .ce-diff-row__sign {
+  color: #047857;
+}
+.ce-diff-row--del .ce-diff-row__sign {
+  color: #b91c1c;
+}
+.ce-diff-row__text {
+  flex: 1;
+  min-width: 0;
 }
 .ce-textarea {
   width: 100%;

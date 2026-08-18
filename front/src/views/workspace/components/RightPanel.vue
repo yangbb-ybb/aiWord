@@ -1,13 +1,17 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import {
   MagicStick,
   Position,
   Share,
-  Bell
+  Bell,
+  ChatDotRound,
+  Delete,
+  Check
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { useDocumentStore } from '@/stores/document'
+import MarkdownIt from 'markdown-it'
+import { useDocumentStore, type ChatMessage } from '@/stores/document'
 import { api, ApiError } from '@/services/api'
 import PlatformChips from './PlatformChips.vue'
 
@@ -44,8 +48,81 @@ const presetPrompts = [
   '帮我写一篇关于 Vite 6 新特性的公众号文章',
   '总结本周产品迭代，要求 800 字以内',
   '把下面的代码片段写成一个技术教程',
-  '用轻松的口吻介绍 TypeScript 5.5'
+  '用轻松的口吻介绍 TypeScript 5.5',
+  '你能做什么？' // 闲聊类提示，让用户看到"非改写"分支
 ]
+
+/** Markdown 渲染实例（用于 AI 的聊天回复） */
+const md = new MarkdownIt({
+  html: false,
+  breaks: true,
+  linkify: true
+})
+
+/** 当前文档的对话流 */
+const chatMessages = computed<ChatMessage[]>(() => {
+  const id = store.current?.id
+  if (!id) return []
+  return store.chatThread.get(id) ?? []
+})
+
+/** 当前是否处于"聊天模式"的实时流式（AI 打字中） */
+const isChatStreaming = computed(
+  () =>
+    store.isGenerating &&
+    store.streamingPreview?.mode === 'chat' &&
+    store.streamingPreview?.docId === store.current?.id
+)
+/** 当前流式中累积的聊天文本 */
+const streamingChatText = computed(() => {
+  const sp = store.streamingPreview
+  if (!isChatStreaming.value || !sp) return ''
+  return sp.accumulated
+})
+
+/** 聊天列表滚动容器 */
+const chatListRef = ref<HTMLElement | null>(null)
+
+/**
+ * 自动滚动聊天列表到最底部：
+ * - 仅在距离底部 ≤ 80px 时强制滚（避免抢走用户手动上滑浏览历史的滚动）
+ * - watch 监听消息数量 + 实时流文本变化
+ */
+async function scrollChatToBottom() {
+  await nextTick()
+  const el = chatListRef.value
+  if (!el) return
+  const distance = el.scrollHeight - el.scrollTop - el.clientHeight
+  if (distance <= 80) {
+    el.scrollTop = el.scrollHeight
+  }
+}
+
+watch(
+  () => chatMessages.value.length,
+  () => scrollChatToBottom()
+)
+watch(streamingChatText, () => scrollChatToBottom())
+
+/** 编辑消息的"行级增减行数"统计（从 postContent 和原内容差异大致估算） */
+function editMsgStats(_msg: ChatMessage): { added: number; removed: number } {
+  // 这里简单返回 0，让 UI 显示"+ 编辑"，真实统计可后续接 diffLines
+  return { added: 0, removed: 0 }
+}
+
+async function handleClearChat() {
+  try {
+    await ElMessageBox.confirm('清空当前文档的 AI 对话历史？', '确认', {
+      confirmButtonText: '清空',
+      cancelButtonText: '取消',
+      type: 'warning'
+    })
+    store.clearChatHistory()
+    ElMessage.success('已清空对话历史')
+  } catch {
+    /* 用户取消 */
+  }
+}
 
 /** 启动时拉一次模型列表，挂掉时给个降级默认值，不阻塞 UI */
 async function loadModels() {
@@ -85,15 +162,21 @@ async function handleGenerate() {
     ElMessage.warning('请填写 Prompt 或先有正文')
     return
   }
+  const userPrompt = prompt.value
+  // 先清空输入框，让用户感觉到"消息已发出"
+  prompt.value = ''
   try {
-    await store.generate({
-      prompt: prompt.value,
+    const result = await store.generate({
+      prompt: userPrompt,
       model: model.value,
       tone: tone.value,
       length: length.value,
       language: language.value
     })
-    ElMessage.success('AI 已生成，请到编辑器审阅改动 ✦')
+    // 编辑模式：弹个 toast 引导用户去审阅 diff；聊天模式不打扰，气泡自动出现在右栏
+    if (result.mode === 'edit') {
+      ElMessage.success('AI 已生成，请到编辑器审阅改动 ✦')
+    }
   } catch (e) {
     const msg = e instanceof ApiError ? `${e.code} · ${e.message}` : '生成失败，请稍后再试'
     ElMessage.error(msg)
@@ -127,6 +210,11 @@ async function handlePublish() {
   } catch {
     // 用户取消
   }
+}
+
+/** 给一段 markdown 字符串生成 HTML（聊天气泡用） */
+function renderMd(text: string): string {
+  return md.render(text || '')
 }
 </script>
 
@@ -179,7 +267,7 @@ async function handlePublish() {
           </div>
         </div>
 
-        <div class="field">
+        <!-- <div class="field">
           <label class="field__label">语言</label>
           <el-radio-group v-model="language" size="default" class="field__control">
             <el-radio-button
@@ -190,7 +278,7 @@ async function handlePublish() {
               {{ o.label }}
             </el-radio-button>
           </el-radio-group>
-        </div>
+        </div> -->
 
         <div class="field">
           <label class="field__label">Prompt</label>
@@ -202,7 +290,7 @@ async function handlePublish() {
           />
         </div>
 
-        <div class="presets">
+        <!-- <div class="presets">
           <button
             v-for="(p, i) in presetPrompts"
             :key="i"
@@ -212,7 +300,7 @@ async function handlePublish() {
           >
             {{ p }}
           </button>
-        </div>
+        </div> -->
 
         <button
           class="generate-btn"
@@ -223,6 +311,82 @@ async function handlePublish() {
           <span v-if="store.isGenerating" class="loader" />
           <span>{{ store.isGenerating ? 'AI 正在创作…' : '一键生成' }}</span>
         </button>
+      </section>
+
+      <!-- AI 对话面板：展示聊天流（编辑类消息以"已修改"形式呈现） -->
+      <section class="block chat-block">
+        <header class="block__head">
+          <el-icon class="block__icon"><ChatDotRound /></el-icon>
+          <span class="block__title">AI 对话</span>
+          <button
+            v-if="chatMessages.length"
+            class="clear-btn"
+            type="button"
+            @click="handleClearChat"
+            title="清空当前文档的对话历史"
+          >
+            <el-icon><Delete /></el-icon>
+            <span>清空</span>
+          </button>
+        </header>
+
+        <div ref="chatListRef" class="chat-list">
+          <!-- 空态 -->
+          <div v-if="!chatMessages.length && !isChatStreaming" class="chat-empty">
+            <el-icon class="chat-empty__icon"><ChatDotRound /></el-icon>
+            <p>在 Prompt 里跟 AI 聊点什么吧——</p>
+            <p>它会智能判断要不要改你的文档</p>
+          </div>
+
+          <!-- 历史消息 -->
+          <div
+            v-for="msg in chatMessages"
+            :key="msg.id"
+            class="bubble-row"
+            :class="{ 'bubble-row--user': msg.role === 'user' }"
+          >
+            <!-- 用户消息 -->
+            <template v-if="msg.role === 'user'">
+              <div class="bubble bubble--user">
+                <div class="bubble__content">{{ msg.content }}</div>
+              </div>
+            </template>
+
+            <!-- AI 闲聊回复 -->
+            <template v-else-if="msg.kind === 'chat'">
+              <div class="bubble bubble--ai">
+                <div class="bubble__avatar">AI</div>
+                <div class="bubble__content markdown-body" v-html="renderMd(msg.content)" />
+              </div>
+            </template>
+
+            <!-- AI 编辑消息 -->
+            <template v-else>
+              <div class="bubble bubble--ai bubble--edit">
+                <div class="bubble__avatar">
+                  <el-icon><Check /></el-icon>
+                </div>
+                <div class="bubble__content bubble__content--edit">
+                  <div class="edit-summary">
+                    <span class="edit-summary__label">已修改文档</span>
+                    <span class="edit-summary__hint">
+                      请到编辑器查看 diff 并"接受/拒绝"
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </div>
+
+          <!-- 聊天模式实时流式（AI 打字中） -->
+          <div v-if="isChatStreaming" class="bubble-row">
+            <div class="bubble bubble--ai bubble--streaming">
+              <div class="bubble__avatar">AI</div>
+              <div class="bubble__content markdown-body" v-html="renderMd(streamingChatText)" />
+              <span class="cursor-blink" />
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- 发布渠道 -->
@@ -450,5 +614,244 @@ async function handlePublish() {
 }
 :deep(.el-slider__runway) {
   margin: 14px 0 4px;
+}
+
+/* ============== AI 对话面板 ============== */
+.chat-block {
+  border-top: 1px dashed var(--border-soft);
+  padding-top: var(--space-4);
+}
+.clear-btn {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.clear-btn:hover {
+  color: var(--color-error, #ef4444);
+  border-color: var(--color-error, #ef4444);
+}
+
+.chat-list {
+  max-height: 360px;
+  min-height: 120px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: 4px 2px;
+  scrollbar-width: thin;
+}
+
+.chat-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-6) var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  text-align: center;
+  gap: 4px;
+}
+.chat-empty__icon {
+  font-size: 28px;
+  color: var(--color-brand);
+  opacity: 0.4;
+  margin-bottom: 6px;
+}
+.chat-empty p {
+  margin: 0;
+}
+
+.bubble-row {
+  display: flex;
+  width: 100%;
+}
+.bubble-row--user {
+  justify-content: flex-end;
+}
+
+.bubble {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  max-width: 92%;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  word-break: break-word;
+}
+.bubble--user {
+  background: var(--color-brand);
+  color: #fff;
+  border-bottom-right-radius: 2px;
+}
+.bubble--user .bubble__content {
+  white-space: pre-wrap;
+}
+.bubble--ai {
+  background: var(--bg-soft, #f5f5f7);
+  color: var(--text-primary);
+  border-bottom-left-radius: 2px;
+}
+.bubble--ai .bubble__content {
+  flex: 1;
+  min-width: 0;
+}
+.bubble--ai .bubble__avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(
+    135deg,
+    var(--color-accent-from) 0%,
+    var(--color-accent-to) 100%
+  );
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.bubble--edit {
+  background: linear-gradient(
+    135deg,
+    rgba(16, 185, 129, 0.08) 0%,
+    rgba(99, 102, 241, 0.08) 100%
+  );
+  border: 1px solid rgba(16, 185, 129, 0.25);
+}
+.bubble--edit .bubble__avatar {
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+}
+.bubble__content--edit {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.edit-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.edit-summary__label {
+  font-weight: 600;
+  color: #059669;
+  font-size: var(--fs-sm);
+}
+.edit-summary__hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.bubble--streaming {
+  position: relative;
+}
+.cursor-blink {
+  display: inline-block;
+  width: 2px;
+  height: 14px;
+  background: var(--color-brand);
+  margin-left: 2px;
+  align-self: center;
+  animation: blink 0.9s steps(2) infinite;
+  flex-shrink: 0;
+}
+@keyframes blink {
+  to {
+    opacity: 0;
+  }
+}
+
+/* Markdown 渲染：聊天气泡里要紧凑一点 */
+.markdown-body {
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  color: inherit;
+}
+.markdown-body :deep(p) {
+  margin: 0 0 6px;
+}
+.markdown-body :deep(p:last-child) {
+  margin-bottom: 0;
+}
+.markdown-body :deep(h1),
+.markdown-body :deep(h2),
+.markdown-body :deep(h3),
+.markdown-body :deep(h4) {
+  margin: 8px 0 4px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.markdown-body :deep(h1) { font-size: 1.1em; }
+.markdown-body :deep(h2) { font-size: 1.05em; }
+.markdown-body :deep(h3),
+.markdown-body :deep(h4) { font-size: 1em; }
+.markdown-body :deep(ul),
+.markdown-body :deep(ol) {
+  margin: 4px 0;
+  padding-left: 1.2em;
+}
+.markdown-body :deep(li) {
+  margin: 2px 0;
+}
+.markdown-body :deep(code) {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 0.92em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.bubble--user .markdown-body :deep(code) {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+}
+.markdown-body :deep(pre) {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 6px 8px;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-size: 0.9em;
+  margin: 6px 0;
+}
+.markdown-body :deep(pre code) {
+  background: transparent;
+  padding: 0;
+}
+.markdown-body :deep(blockquote) {
+  border-left: 3px solid currentColor;
+  padding-left: 8px;
+  opacity: 0.8;
+  margin: 4px 0;
+}
+.markdown-body :deep(a) {
+  color: var(--color-brand);
+  text-decoration: underline;
+}
+.markdown-body :deep(strong) {
+  font-weight: 700;
+}
+.markdown-body :deep(table) {
+  border-collapse: collapse;
+  margin: 6px 0;
+  font-size: 0.92em;
+}
+.markdown-body :deep(th),
+.markdown-body :deep(td) {
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  padding: 3px 6px;
 }
 </style>

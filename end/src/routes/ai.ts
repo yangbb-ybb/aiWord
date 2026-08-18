@@ -6,6 +6,7 @@ import {
   runSummarize,
   runTranslate
 } from '~/services/ai'
+import { resolveApiKey } from '~/providers'
 
 const generateBody = z.object({
   prompt: z.string().default(''),
@@ -17,12 +18,18 @@ const generateBody = z.object({
   language: z.enum(['zh', 'en', 'mixed']).optional(),
   /** 已存在的正文（续写场景） */
   contextText: z.string().optional(),
-  /** 对话历史：[{role, content}] —— AI 用它"记住"之前几轮生成过什么 */
+  /** 对话历史：[{role, content, kind?}] —— AI 用它"记住"之前几轮做过什么
+   *  - kind='edit'    → content 是 AI 之前给出的"完整新文档"
+   *  - kind='analyze' → content 是 AI 之前给出的"评价/建议"
+   *  - kind='chat'    → content 是 AI 之前的聊天回复
+   *  - 缺省视为 'edit'，保持向后兼容
+   */
   history: z
     .array(
       z.object({
         role: z.enum(['user', 'assistant']),
-        content: z.string()
+        content: z.string(),
+        kind: z.enum(['edit', 'analyze', 'chat']).optional()
       })
     )
     .optional()
@@ -46,6 +53,25 @@ const translateBody = z.object({
   targetLang: z.enum(['zh', 'en', 'mixed']),
   model: z.string().optional()
 })
+
+/**
+ * 在真正走 SSE 流之前拦截无 API Key 的情况：直接返回 503 + 友好提示。
+ * 替代之前在 Anthropic SDK 里抛 "Could not resolve authentication method" 的尴尬错误。
+ */
+function ensureAiAvailable(req: any, reply: any): boolean {
+  try {
+    resolveApiKey()
+    return true
+  } catch (e: any) {
+    req.log.error({ aiEvent: 'no_api_key', err: e }, 'AI service not configured')
+    reply.code(503).send({
+      code: 'AI_NOT_CONFIGURED',
+      message:
+        'AI 服务未配置 API Key。请在 end/.env 里设置 MINIMAX_API_KEY 或 ANTHROPIC_API_KEY 后重启后端。'
+    })
+    return false
+  }
+}
 
 /**
  * 通用：流式调用 AI 服务并把每个 chunk 写成 SSE。
@@ -114,6 +140,7 @@ async function streamAi(
 
 export default async function aiRoutes(app: FastifyInstance) {
   app.post('/generate', async (req, reply) => {
+    if (!ensureAiAvailable(req, reply)) return
     const body = generateBody.parse(req.body)
     // 单独写一条"开始生成"的日志，方便排查
     req.log.info(
@@ -134,6 +161,7 @@ export default async function aiRoutes(app: FastifyInstance) {
   })
 
   app.post('/rewrite', async (req, reply) => {
+    if (!ensureAiAvailable(req, reply)) return
     const body = rewriteBody.parse(req.body)
     req.log.info(
       {
@@ -149,6 +177,7 @@ export default async function aiRoutes(app: FastifyInstance) {
   })
 
   app.post('/summarize', async (req, reply) => {
+    if (!ensureAiAvailable(req, reply)) return
     const body = summarizeBody.parse(req.body)
     req.log.info(
       {
@@ -165,6 +194,7 @@ export default async function aiRoutes(app: FastifyInstance) {
   })
 
   app.post('/translate', async (req, reply) => {
+    if (!ensureAiAvailable(req, reply)) return
     const body = translateBody.parse(req.body)
     req.log.info(
       {
@@ -181,13 +211,23 @@ export default async function aiRoutes(app: FastifyInstance) {
   })
 
   // 列出 provider 模型 —— 前端 select 直接渲染这里的 list
-  app.get('/models', async (req) => {
+  // 注意：getProvider() 会在缺 key 时抛错，这里捕获并返回 provider=null，让前端走降级
+  app.get('/models', async (req, reply) => {
     const { getProvider } = await import('~/providers')
-    const p = getProvider()
-    req.log.info(
-      { aiEvent: 'list_models', provider: p.name, modelCount: p.listModels().length },
-      'ai list models'
-    )
-    return { provider: p.name, models: p.listModels() }
+    try {
+      const p = getProvider()
+      req.log.info(
+        { aiEvent: 'list_models', provider: p.name, modelCount: p.listModels().length },
+        'ai list models'
+      )
+      return { provider: p.name, models: p.listModels(), configured: true }
+    } catch (e: any) {
+      req.log.warn(
+        { aiEvent: 'list_models_failed', err: e?.message },
+        'AI not configured; returning empty model list'
+      )
+      // 返回 200 + 空列表 + configured=false，前端能据此给降级提示
+      return { provider: null, models: [], configured: false }
+    }
   })
 }

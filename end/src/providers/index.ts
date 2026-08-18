@@ -20,18 +20,39 @@ const ANTHROPIC_MODELS = [
 
 let cached: AIProvider | null = null
 
+/** key 是否"实际可用"——非 undefined 且 trim 后非空 */
+function hasUsableKey(v: string | undefined): boolean {
+  return typeof v === 'string' && v.trim().length > 0
+}
+
+/**
+ * 拿到一个真正可用的 API key；如果两个都没配，抛错让上层返回 503。
+ * 比 Anthropic SDK 自己抛的 "Could not resolve authentication method" 更友好。
+ */
+export function resolveApiKey(): { provider: 'minimax' | 'anthropic'; apiKey: string } {
+  if (hasUsableKey(env.MINIMAX_API_KEY)) {
+    return { provider: 'minimax', apiKey: env.MINIMAX_API_KEY!.trim() }
+  }
+  if (hasUsableKey(env.ANTHROPIC_API_KEY)) {
+    return { provider: 'anthropic', apiKey: env.ANTHROPIC_API_KEY!.trim() }
+  }
+  throw new Error(
+    'AI 服务未配置 API Key：请在 end/.env 里设置 MINIMAX_API_KEY（推荐）或 ANTHROPIC_API_KEY'
+  )
+}
+
 /**
  * 单例工厂：第一个 provider 选定后缓存，避免每次请求重新构造 SDK 客户端。
  * 切换 provider 需要重启。
  */
 export function getProvider(): AIProvider {
   if (cached) return cached
-  const which = pickAiProvider()
+  const { provider, apiKey } = resolveApiKey()
 
-  if (which === 'minimax') {
+  if (provider === 'minimax') {
     cached = createClaudeProvider({
       name: 'minimax',
-      apiKey: env.MINIMAX_API_KEY,
+      apiKey,
       baseURL: env.MINIMAX_BASE_URL,
       defaultModel: env.MINIMAX_MODEL,
       models: MINIMAX_MODELS
@@ -39,7 +60,7 @@ export function getProvider(): AIProvider {
   } else {
     cached = createClaudeProvider({
       name: 'anthropic',
-      apiKey: env.ANTHROPIC_API_KEY,
+      apiKey,
       baseURL: env.ANTHROPIC_BASE_URL,
       defaultModel: 'claude-sonnet-4-5',
       models: ANTHROPIC_MODELS
