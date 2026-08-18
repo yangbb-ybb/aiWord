@@ -128,6 +128,7 @@ async function onUserCommand(cmd: string) {
   height: var(--topbar-height);
   display: flex;
   align-items: center;
+  justify-content: space-between;
   padding: 0 var(--space-5);
   background: var(--bg-card);
   border-bottom: 1px solid var(--border-soft);

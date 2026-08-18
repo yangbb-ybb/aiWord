@@ -83,6 +83,10 @@ export const wechatQrSessions = mysqlTable('wechat_qr_sessions', {
 /** 文档主表 —— 与前端 store 模型强对齐 */
 export const documents = mysqlTable('documents', {
   id: bigint('id', { mode: 'number', unsigned: true }).autoincrement().primaryKey(),
+  /** 文档归属用户，删 user 时一并清掉 */
+  userId: bigint('user_id', { mode: 'number', unsigned: true })
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
   title: varchar('title', { length: 255 }).notNull(),
   excerpt: varchar('excerpt', { length: 500 }),
   content: text('content'),

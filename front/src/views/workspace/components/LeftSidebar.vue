@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import { Plus, Document, ChatLineRound, Tickets } from '@element-plus/icons-vue'
 import {
   useDocumentStore,
@@ -11,6 +11,12 @@ import {
 const store = useDocumentStore()
 
 const recentDocs = computed(() => store.documents)
+
+onMounted(() => {
+  // 进入工作台时并行拉取：文档列表 + 模板列表
+  store.loadDocuments()
+  store.loadTemplates()
+})
 
 function formatDate(iso: string) {
   const d = new Date(iso)
@@ -50,7 +56,20 @@ function handleTemplate(id: string) {
           <span>最近</span>
           <em class="group__count">{{ recentDocs.length }}</em>
         </header>
-        <ul class="doc-list">
+
+        <div v-if="store.documentsLoading" class="template-empty">
+          <span class="loader" />
+          <span>正在加载文档…</span>
+        </div>
+
+        <div
+          v-else-if="store.documentsLoaded && recentDocs.length === 0"
+          class="template-empty"
+        >
+          <span>暂无文档，点击上方"新建文档"开始</span>
+        </div>
+
+        <ul v-else class="doc-list">
           <li
             v-for="doc in recentDocs"
             :key="doc.id"
@@ -80,11 +99,27 @@ function handleTemplate(id: string) {
           <el-icon><Tickets /></el-icon>
           <span>模板</span>
         </header>
-        <ul class="template-list">
+
+        <div v-if="store.templatesLoading" class="template-empty">
+          <span class="loader" />
+          <span>正在加载模板…</span>
+        </div>
+
+        <div
+          v-else-if="store.templatesLoaded && store.templates.length === 0"
+          class="template-empty"
+        >
+          <span>暂无模板，请联系管理员配置</span>
+        </div>
+
+        <ul v-else class="template-list">
           <li
             v-for="tpl in store.templates"
             :key="tpl.id"
             class="template-item"
+            :class="{
+              'template-item--selected': store.selectedTemplateId === tpl.id
+            }"
             @click="handleTemplate(tpl.id)"
           >
             <span class="template-item__emoji">{{ tpl.emoji }}</span>
@@ -98,7 +133,7 @@ function handleTemplate(id: string) {
 
       <footer class="hint">
         <el-icon><ChatLineRound /></el-icon>
-        <span>点击模板会在新文档里套用内容</span>
+        <span>文档已与账号绑定，仅自己可见</span>
       </footer>
     </div>
   </aside>
@@ -222,6 +257,25 @@ function handleTemplate(id: string) {
   flex-direction: column;
   gap: 4px;
 }
+.template-empty {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: var(--space-3);
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  background: var(--bg-muted);
+  border-radius: var(--radius-md);
+}
+.template-empty .loader {
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(99, 102, 241, 0.25);
+  border-top-color: var(--color-brand);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
 .template-item {
   display: flex;
   align-items: center;
@@ -233,6 +287,13 @@ function handleTemplate(id: string) {
 }
 .template-item:hover {
   background: var(--bg-muted);
+}
+.template-item--selected {
+  background: var(--color-brand-light);
+  border: 1px solid rgba(79, 70, 229, 0.25);
+}
+.template-item--selected:hover {
+  background: var(--color-brand-light);
 }
 .template-item__emoji {
   font-size: 22px;

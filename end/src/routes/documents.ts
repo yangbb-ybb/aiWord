@@ -23,18 +23,24 @@ const updateBody = z.object({
 })
 
 export default async function documentsRoutes(app: FastifyInstance) {
-  app.get('/', async () => ({ items: await listDocuments() }))
+  // 所有文档接口都要求登录；req.user 由 authRequired 注入
+  app.addHook('preHandler', app.authRequired)
+
+  app.get('/', async (req) => {
+    const items = await listDocuments(Number(req.user!.id))
+    return { items }
+  })
 
   app.get('/:id', async (req, reply) => {
     const { id } = idParam.parse(req.params)
-    const doc = await getDocument(id)
+    const doc = await getDocument(id, Number(req.user!.id))
     if (!doc) return reply.code(404).send({ code: 'NOT_FOUND' })
     return doc
   })
 
   app.post('/', async (req, reply) => {
     const body = createBody.parse(req.body)
-    const doc = await createDocument(body)
+    const doc = await createDocument(body, Number(req.user!.id))
     reply.code(201)
     return doc
   })
@@ -42,14 +48,15 @@ export default async function documentsRoutes(app: FastifyInstance) {
   app.put('/:id', async (req, reply) => {
     const { id } = idParam.parse(req.params)
     const body = updateBody.parse(req.body)
-    const doc = await updateDocument(id, body)
+    const doc = await updateDocument(id, body, Number(req.user!.id))
     if (!doc) return reply.code(404).send({ code: 'NOT_FOUND' })
     return doc
   })
 
   app.delete('/:id', async (req, reply) => {
     const { id } = idParam.parse(req.params)
-    await deleteDocument(id)
+    const ok = await deleteDocument(id, Number(req.user!.id))
+    if (!ok) return reply.code(404).send({ code: 'NOT_FOUND' })
     reply.code(204)
     return null
   })

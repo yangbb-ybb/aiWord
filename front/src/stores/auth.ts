@@ -34,6 +34,8 @@ export const useAuthStore = defineStore('auth', () => {
   const user = ref<UserPublic | null>(null)
   /** token 只在 localStorage 里存；store 不再单独留一份，避免状态漂移 */
   const hasToken = ref(!!getAccessToken())
+  /** 防重入：避免并发或快速重复触发 fetchMe（之前在 401 死循环时会被打爆） */
+  const fetchingMe = ref(false)
 
   const isAuthenticated = computed(() => hasToken.value && !!user.value)
 
@@ -57,11 +59,23 @@ export const useAuthStore = defineStore('auth', () => {
 
   /** 拿当前用户 —— 启动时如果有 token 就调一次 */
   async function fetchMe() {
+    // 已经有 user 就别再打，省一次往返
+    if (user.value) return user.value
     if (!getAccessToken()) {
       user.value = null
       hasToken.value = false
       return null
     }
+    // 已有进行中的 fetchMe，复用其结果，避免重复打 /api/users/me
+    if (fetchingMe.value) {
+      // 简单轮询等待，最多 ~2s
+      const start = Date.now()
+      while (fetchingMe.value && Date.now() - start < 2000) {
+        await new Promise((r) => setTimeout(r, 50))
+      }
+      return user.value
+    }
+    fetchingMe.value = true
     try {
       const { user: u } = await api.get<{ user: UserPublic }>('/api/users/me')
       user.value = u
@@ -74,6 +88,8 @@ export const useAuthStore = defineStore('auth', () => {
         hasToken.value = false
       }
       return null
+    } finally {
+      fetchingMe.value = false
     }
   }
 

@@ -3,7 +3,7 @@ import {
   createWebHistory,
   type RouteRecordRaw
 } from 'vue-router'
-import { getAccessToken } from '@/services/api'
+import { getAccessToken, setUnauthorizedHandler } from '@/services/api'
 import { useAuthStore } from '@/stores/auth'
 
 const routes: RouteRecordRaw[] = [
@@ -23,6 +23,19 @@ const routes: RouteRecordRaw[] = [
 const router = createRouter({
   history: createWebHistory(),
   routes
+})
+
+/**
+ * 任何受保护接口收到 401 → 走 router.push 跳登录页（SPA 导航，不硬刷）。
+ * 避免 axios 拦截器直接 location.href 引发"批量旧请求 + 重复 fetchMe"的死循环。
+ */
+setUnauthorizedHandler(() => {
+  if (router.currentRoute.value.path !== '/login') {
+    const redirect = encodeURIComponent(
+      router.currentRoute.value.fullPath
+    )
+    router.replace({ path: '/login', query: { redirect } })
+  }
 })
 
 router.beforeEach(async (to) => {
@@ -46,10 +59,11 @@ router.beforeEach(async (to) => {
   // 有 token 但 store 里还没有 user：尝试拉一次
   const auth = useAuthStore()
   if (!auth.user) {
+    console.log(1);
     await auth.fetchMe()
-    if (!auth.user) {
-      return { path: '/login', query: { redirect: to.fullPath } }
-    }
+    // if (!auth.user) {
+    //   return { path: '/login', query: { redirect: to.fullPath } }
+    // }
   }
   return true
 })

@@ -1,7 +1,7 @@
 /**
  * axios 封装：
  * - 自动从 localStorage 读 token 注入 Authorization
- * - 收到 401 自动清 token 并跳 /login?redirect=...
+ * - 收到 401 只清 token + 触发 onUnauthorized 回调，跳转交给 router（避免 location.href 硬刷导致请求堆积/重复触发 fetchMe）
  * - refresh 接口走第二个实例，避免全局拦截器在 refresh 失败时递归跳登录
  * - 后端基础 URL 通过 VITE_API_BASE_URL 配置，默认 http://localhost:8787
  */
@@ -59,8 +59,15 @@ function toApiError(err: AxiosError<BackendError>): ApiError {
   )
 }
 
+/** 全局 401 监听：路由/业务层订阅后自行决定跳不跳 /login */
+type UnauthorizedHandler = () => void
+let onUnauthorized: UnauthorizedHandler | null = null
+export function setUnauthorizedHandler(fn: UnauthorizedHandler | null) {
+  onUnauthorized = fn
+}
+
 /** 创建 axios 实例并统一错误处理 */
-function createHttp(opts: { on401Redirect?: boolean }): AxiosInstance {
+function createHttp(_opts: { on401Redirect?: boolean }): AxiosInstance {
   const inst = axios.create({
     baseURL: BASE_URL,
     timeout: 30_000,
@@ -76,14 +83,10 @@ function createHttp(opts: { on401Redirect?: boolean }): AxiosInstance {
   inst.interceptors.response.use(
     (res) => res,
     (err: AxiosError<BackendError>) => {
-      if (opts.on401Redirect && err.response?.status === 401) {
+      if (err.response?.status === 401) {
+        // 只清 token + 通知订阅者。不要在这里 location.href，会触发硬刷新导致旧请求堆积。
         clearTokens()
-        if (location.pathname !== '/login') {
-          const redirect = encodeURIComponent(
-            location.pathname + location.search
-          )
-          location.href = `/login?redirect=${redirect}`
-        }
+        if (onUnauthorized) onUnauthorized()
       }
       throw toApiError(err)
     }

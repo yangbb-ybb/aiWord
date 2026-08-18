@@ -8,7 +8,10 @@ import {
   Download,
   Link,
   Picture,
-  List
+  List,
+  MagicStick,
+  CircleClose,
+  Check
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { useDocumentStore } from '@/stores/document'
@@ -36,6 +39,26 @@ const currentTitle = computed({
 const currentContent = computed(() => store.current?.content ?? '')
 
 const rendered = computed(() => md.render(currentContent.value))
+
+/** 保存状态指示：idle / saving / saved */
+const saveStatus = computed<'idle' | 'saving' | 'saved'>(() => {
+  const id = store.current?.id
+  if (!id) return 'idle'
+  if (store.savingIds.has(id)) return 'saving'
+  if (store.lastSavedAt.has(id)) return 'saved'
+  return 'idle'
+})
+const saveStatusClass = computed(() => `save-status--${saveStatus.value}`)
+const saveStatusText = computed(() => {
+  switch (saveStatus.value) {
+    case 'saving':
+      return '保存中…'
+    case 'saved':
+      return '已保存'
+    default:
+      return ''
+  }
+})
 
 function onEditorInput(e: Event) {
   const v = (e.target as HTMLTextAreaElement).value
@@ -90,6 +113,16 @@ function exportDocx() {
   ElMessage.warning('导出 .docx 将在第二阶段接入')
 }
 
+function acceptDiff() {
+  if (store.acceptPendingDiff()) {
+    ElMessage.success('已应用 AI 改动 ✦')
+  }
+}
+function rejectDiff() {
+  store.rejectPendingDiff()
+  ElMessage.info('已丢弃 AI 改动')
+}
+
 watch(
   () => store.currentId,
   () => {
@@ -110,6 +143,11 @@ watch(
           placeholder="无标题文档"
           spellcheck="false"
         />
+        <span class="save-status" :class="saveStatusClass">
+          <span v-if="saveStatus === 'saving'" class="loader" />
+          <span v-else-if="saveStatus === 'saved'" class="dot dot--ok" />
+          <span class="save-status__text">{{ saveStatusText }}</span>
+        </span>
         <div class="ce-actions">
           <el-tooltip content="复制 Markdown" placement="bottom">
             <button class="icon-btn" @click="copyMarkdown">
@@ -169,6 +207,70 @@ watch(
             <el-icon><View /></el-icon>
             <span>预览</span>
           </button>
+        </div>
+      </div>
+
+      <!-- AI 实时打字预览：流式生成时显示，让用户看到 AI 在输出 -->
+      <div v-if="store.streamingPreview" class="ai-stream-panel">
+        <header class="ai-stream-panel__head">
+          <div class="ai-stream-panel__title">
+            <span class="ai-stream-panel__dot" />
+            <span>AI 正在创作…</span>
+            <em class="ai-stream-panel__prompt">{{ store.streamingPreview.prompt }}</em>
+          </div>
+          <span class="ai-stream-panel__counter">
+            {{ store.streamingPreview.accumulated.length }} 字
+          </span>
+        </header>
+        <div class="ai-stream-panel__body">
+          <pre class="ai-stream-panel__text">{{ store.streamingPreview.accumulated }}<span class="caret" /></pre>
+        </div>
+      </div>
+
+      <!-- AI 改动预览：有 pendingDiff 时显示，编辑区临时禁用 -->
+      <div v-else-if="store.pendingDiff" class="ai-diff-panel">
+        <header class="ai-diff-panel__head">
+          <div class="ai-diff-panel__title">
+            <el-icon><MagicStick /></el-icon>
+            <span>AI 提议的改动</span>
+            <em class="ai-diff-panel__stats">
+              <span class="diff-stat diff-stat--add">+{{ store.pendingDiffSummary.added }}</span>
+              <span class="diff-stat diff-stat--del">-{{ store.pendingDiffSummary.removed }}</span>
+            </em>
+          </div>
+          <div class="ai-diff-panel__actions">
+            <button class="diff-btn diff-btn--ghost" @click="rejectDiff">
+              <el-icon><CircleClose /></el-icon>
+              <span>拒绝</span>
+            </button>
+            <button class="diff-btn diff-btn--primary" @click="acceptDiff">
+              <el-icon><Check /></el-icon>
+              <span>接受</span>
+            </button>
+          </div>
+        </header>
+
+        <div class="ai-diff-panel__body">
+          <div
+            v-for="(part, i) in store.pendingDiff.diffParts"
+            :key="i"
+            class="diff-part"
+            :class="{
+              'diff-part--add': part.added,
+              'diff-part--del': part.removed
+            }"
+          >
+            <span
+              v-for="(line, j) in part.value.split('\n').filter(Boolean)"
+              :key="j"
+              class="diff-line"
+            >
+              <span class="diff-line__sign">
+                {{ part.added ? '+' : part.removed ? '−' : ' ' }}
+              </span>
+              <span class="diff-line__text">{{ line }}</span>
+            </span>
+          </div>
         </div>
       </div>
 
@@ -247,6 +349,299 @@ watch(
 .icon-btn:hover {
   background: var(--bg-muted);
   color: var(--color-brand);
+}
+
+.save-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  min-width: 80px;
+  user-select: none;
+}
+.save-status--saving {
+  color: var(--color-brand);
+}
+.save-status--saved {
+  color: #10b981;
+}
+.save-status .loader {
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(79, 70, 229, 0.25);
+  border-top-color: var(--color-brand);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+.save-status .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #10b981;
+}
+.save-status .dot--ok {
+  background: #10b981;
+}
+
+/* ---------- AI diff 预览面板 ---------- */
+.ai-diff-panel {
+  display: flex;
+  flex-direction: column;
+  max-height: 50vh;
+  border-bottom: 1px solid var(--border-soft);
+  background: linear-gradient(
+    180deg,
+    rgba(99, 102, 241, 0.04) 0%,
+    var(--bg-card) 100%
+  );
+  animation: slideDown 0.25s ease;
+}
+.ai-diff-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-6);
+  border-bottom: 1px dashed var(--border-soft);
+  background: var(--bg-card);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.ai-diff-panel__title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.ai-diff-panel__title .el-icon {
+  color: var(--color-brand);
+  font-size: 16px;
+}
+.ai-diff-panel__stats {
+  font-style: normal;
+  display: inline-flex;
+  gap: 6px;
+  margin-left: 4px;
+}
+.diff-stat {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.diff-stat--add {
+  color: #047857;
+  background: rgba(16, 185, 129, 0.12);
+}
+.diff-stat--del {
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.12);
+}
+.ai-diff-panel__actions {
+  display: inline-flex;
+  gap: var(--space-2);
+}
+.diff-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 12px;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.diff-btn--ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+}
+.diff-btn--ghost:hover {
+  background: var(--bg-muted);
+  color: #b91c1c;
+  border-color: #b91c1c;
+}
+.diff-btn--primary {
+  background: linear-gradient(
+    135deg,
+    var(--color-accent-from) 0%,
+    var(--color-accent-to) 100%
+  );
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+}
+.diff-btn--primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(99, 102, 241, 0.42);
+}
+
+.ai-diff-panel__body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-3) var(--space-6);
+  font-family: 'Menlo', 'Consolas', 'Monaco', monospace;
+  font-size: 13px;
+  line-height: 1.65;
+}
+.diff-part {
+  display: block;
+}
+.diff-part--add {
+  background: rgba(16, 185, 129, 0.08);
+  border-left: 3px solid #10b981;
+  padding-left: 6px;
+  margin: 2px 0;
+}
+.diff-part--del {
+  background: rgba(239, 68, 68, 0.06);
+  border-left: 3px solid #ef4444;
+  padding-left: 6px;
+  margin: 2px 0;
+  text-decoration: line-through;
+  text-decoration-color: rgba(239, 68, 68, 0.45);
+  opacity: 0.85;
+}
+.diff-line {
+  display: flex;
+  gap: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.diff-line__sign {
+  width: 14px;
+  flex-shrink: 0;
+  text-align: center;
+  color: var(--text-muted);
+  user-select: none;
+}
+.diff-part--add .diff-line__sign {
+  color: #047857;
+  font-weight: 700;
+}
+.diff-part--del .diff-line__sign {
+  color: #b91c1c;
+  font-weight: 700;
+}
+.diff-line__text {
+  flex: 1;
+  min-width: 0;
+}
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ---------- AI 实时打字预览面板 ---------- */
+.ai-stream-panel {
+  display: flex;
+  flex-direction: column;
+  max-height: 40vh;
+  border-bottom: 1px solid var(--border-soft);
+  background: linear-gradient(
+    180deg,
+    rgba(99, 102, 241, 0.06) 0%,
+    var(--bg-card) 100%
+  );
+  animation: slideDown 0.2s ease;
+}
+.ai-stream-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-6);
+  border-bottom: 1px dashed var(--border-soft);
+  background: var(--bg-card);
+}
+.ai-stream-panel__title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--color-brand);
+  min-width: 0;
+}
+.ai-stream-panel__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-brand);
+  box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.4);
+  animation: pulse 1.2s infinite;
+  flex-shrink: 0;
+}
+.ai-stream-panel__prompt {
+  font-style: normal;
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.ai-stream-panel__counter {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  background: var(--bg-muted);
+  padding: 2px 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+.ai-stream-panel__body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-3) var(--space-6);
+}
+.ai-stream-panel__text {
+  margin: 0;
+  font-family: 'Menlo', 'Consolas', 'Monaco', monospace;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ai-stream-panel__text .caret {
+  display: inline-block;
+  width: 7px;
+  height: 14px;
+  background: var(--color-brand);
+  vertical-align: text-bottom;
+  margin-left: 1px;
+  animation: blink 1s steps(2) infinite;
+}
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.45);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(99, 102, 241, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(99, 102, 241, 0);
+  }
+}
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
 }
 
 .ce-toolbar {

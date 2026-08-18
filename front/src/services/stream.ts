@@ -1,0 +1,133 @@
+/**
+ * 调用后端 SSE 流式接口：POST /api/ai/generate 等。
+ * 后端用 Fastify reply.raw.write(...) 按规范输出：
+ *   event: chunk | done | error
+ *   data: { text: '...' } | { text, tokens } | { message }
+ *
+ * 这里不引入 EventSource（它只支持 GET），改成 fetch + ReadableStream 手动解析。
+ */
+import { BASE_URL, getAccessToken, ApiError } from './api'
+
+export { ApiError }
+
+export interface StreamChunkEvent {
+  text: string
+}
+export interface StreamDoneEvent {
+  text: string
+  tokens?: number
+}
+export interface StreamErrorEvent {
+  message: string
+}
+
+export interface StreamHandlers {
+  onDelta?: (delta: string) => void
+  onDone?: (payload: StreamDoneEvent) => void
+  onError?: (payload: StreamErrorEvent) => void
+}
+
+/**
+ * 发起一次流式 POST。返回 Promise<fullText>。
+ * - 如果中途后端发了 `event: error`，抛 ApiError。
+ * - 如果网络层就挂了，抛 ApiError('NETWORK_ERROR')。
+ */
+export async function postStream(
+  path: string,
+  body: unknown,
+  handlers: StreamHandlers = {}
+): Promise<string> {
+  const token = getAccessToken()
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    accept: 'text/event-stream'
+  }
+  if (token) headers.authorization = `Bearer ${token}`
+
+  const res = await fetch(BASE_URL + path, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body ?? {}),
+    // 不让 axios/fetch 缓存
+    cache: 'no-store'
+  })
+
+  if (!res.ok) {
+    // 后端 SSE 在出错时会降级成普通 JSON（其实只有 5xx 才会进 errorHandler）。
+    // 这里先尝试读一下 body，给一个友好错误。
+    let payload: { code?: string; message?: string } | undefined
+    try {
+      payload = (await res.json()) as typeof payload
+    } catch {
+      /* 不是 JSON 就忽略 */
+    }
+    throw new ApiError(
+      res.status,
+      payload?.code ?? 'STREAM_HTTP_ERROR',
+      payload?.message ?? `SSE 请求失败：HTTP ${res.status}`
+    )
+  }
+
+  if (!res.body) {
+    throw new ApiError(0, 'NO_BODY', '响应没有 body')
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+  let currentEvent = ''
+  let fullText = ''
+
+  // SSE 一帧由若干行组成：event: <name>\n data: <json>\n\n
+  const flushFrame = (frame: string) => {
+    if (!frame) return
+    let dataLine: string | null = null
+    for (const line of frame.split('\n')) {
+      if (line.startsWith('event:')) {
+        currentEvent = line.slice(6).trim()
+      } else if (line.startsWith('data:')) {
+        dataLine = line.slice(5).trim()
+      }
+    }
+    if (dataLine == null) return
+    let payload: unknown
+    try {
+      payload = JSON.parse(dataLine)
+    } catch {
+      payload = { text: dataLine }
+    }
+    if (currentEvent === 'chunk') {
+      const text = (payload as StreamChunkEvent)?.text ?? ''
+      fullText += text
+      handlers.onDelta?.(text)
+    } else if (currentEvent === 'done') {
+      const p = payload as StreamDoneEvent
+      // 兜底：若 done 自带 text 但 chunk 没汇齐，用 done.text 补上
+      if (p.text && p.text.length > fullText.length) fullText = p.text
+      handlers.onDone?.(p)
+    } else if (currentEvent === 'error') {
+      const p = payload as StreamErrorEvent
+      handlers.onError?.(p)
+      throw new ApiError(res.status, 'STREAM_ERROR', p.message ?? 'AI 生成失败')
+    }
+  }
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    // 按空行（\n\n）切帧，剩下的尾巴塞回 buffer
+    let idx = buffer.indexOf('\n\n')
+    while (idx !== -1) {
+      const frame = buffer.slice(0, idx)
+      buffer = buffer.slice(idx + 2)
+      flushFrame(frame)
+      idx = buffer.indexOf('\n\n')
+    }
+  }
+  // 流关闭后再 flush 一次尾巴
+  flushFrame(buffer)
+
+  return fullText
+}

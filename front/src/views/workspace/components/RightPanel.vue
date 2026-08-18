@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import {
   MagicStick,
   Position,
@@ -8,23 +8,26 @@ import {
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useDocumentStore } from '@/stores/document'
+import { api, ApiError } from '@/services/api'
 import PlatformChips from './PlatformChips.vue'
+
+interface AiModel {
+  id: string
+  label: string
+}
 
 const store = useDocumentStore()
 
 const model = ref('claude-sonnet')
 const tone = ref('formal')
-const length = ref(60)
+const length = ref(50)
 const language = ref('zh')
 const prompt = ref('')
 
-const modelOptions = [
-  { label: 'Claude Sonnet', value: 'claude-sonnet' },
-  { label: 'GPT-4o', value: 'gpt-4o' },
-  { label: 'DeepSeek', value: 'deepseek' },
-  { label: '通义千问', value: 'tongyi' },
-  { label: '文心一言', value: 'wenxin' }
-]
+const modelOptions = ref<{ label: string; value: string }[]>([])
+const providerName = ref('minimax')
+const loadingModels = ref(false)
+
 const toneOptions = [
   { label: '正式', value: 'formal' },
   { label: '口语', value: 'casual' },
@@ -44,6 +47,31 @@ const presetPrompts = [
   '用轻松的口吻介绍 TypeScript 5.5'
 ]
 
+/** 启动时拉一次模型列表，挂掉时给个降级默认值，不阻塞 UI */
+async function loadModels() {
+  loadingModels.value = true
+  try {
+    const res = await api.get<{ provider: string; models: AiModel[] }>('/api/ai/models')
+    providerName.value = res.provider
+    modelOptions.value = res.models.map((m) => ({ label: m.label, value: m.id }))
+    if (modelOptions.value.length && !modelOptions.value.some((o) => o.value === model.value)) {
+      model.value = modelOptions.value[0].value
+    }
+  } catch (e) {
+    const msg = e instanceof ApiError ? e.message : '模型列表加载失败'
+    ElMessage.warning(`${msg}（已使用默认模型）`)
+    // 兜底：保证下拉至少有一条
+    if (!modelOptions.value.length) {
+      modelOptions.value = [{ label: 'minimax · Sonnet（推荐）', value: 'claude-sonnet' }]
+      providerName.value = 'minimax'
+    }
+  } finally {
+    loadingModels.value = false
+  }
+}
+
+onMounted(loadModels)
+
 function applyPreset(p: string) {
   prompt.value = p
 }
@@ -58,10 +86,17 @@ async function handleGenerate() {
     return
   }
   try {
-    await store.generate(prompt.value)
-    ElMessage.success('AI 生成完成，已追加到正文末尾 ✦')
+    await store.generate({
+      prompt: prompt.value,
+      model: model.value,
+      tone: tone.value,
+      length: length.value,
+      language: language.value
+    })
+    ElMessage.success('AI 已生成，请到编辑器审阅改动 ✦')
   } catch (e) {
-    ElMessage.error('生成失败，请稍后再试')
+    const msg = e instanceof ApiError ? `${e.code} · ${e.message}` : '生成失败，请稍后再试'
+    ElMessage.error(msg)
   }
 }
 
@@ -191,7 +226,7 @@ async function handlePublish() {
       </section>
 
       <!-- 发布渠道 -->
-      <section class="block">
+      <!-- <section class="block">
         <header class="block__head">
           <el-icon class="block__icon"><Position /></el-icon>
           <span class="block__title">发布渠道</span>
@@ -211,7 +246,7 @@ async function handlePublish() {
         <p class="publish-hint">
           发布通道将在第二阶段接入（OAuth + 各平台 API）
         </p>
-      </section>
+      </section> -->
     </div>
   </aside>
 </template>

@@ -1,4 +1,4 @@
-import { getProvider } from '~/providers'
+import { getProvider, resolveModel } from '~/providers'
 import type { Message } from '~/providers/types'
 
 /** 前端风格 → 自然语言描述 */
@@ -9,28 +9,39 @@ const TONE_DESC: Record<string, string> = {
   technical: '技术深度高、术语准确、代码示例'
 }
 
-/** 前端长度档位 → 字数提示 */
-const LENGTH_DESC: Record<string, string> = {
-  short: '300 字左右',
-  medium: '600 字左右',
-  medium_long: '1200 字左右',
-  long: '2000 字以上'
-}
-
 const LANG_DESC: Record<string, string> = {
   zh: '中文',
   en: 'English',
   mixed: '中英混合'
 }
 
+/**
+ * 前端滑块值（0/25/50/75/100） → 字数描述。
+ * 0=短, 25=中短, 50=中长, 75=长, 100=超长
+ */
+function lengthToText(n: number): string {
+  if (n <= 0) return '300 字以内'
+  if (n <= 25) return '300~500 字'
+  if (n <= 50) return '500~900 字'
+  if (n <= 75) return '900~1500 字'
+  return '1500 字以上（深度长文）'
+}
+
 export interface GenerateInput {
   prompt: string
+  /** 前端下拉的 model id，如 'claude-sonnet' / 'claude-haiku' / 'claude-opus' */
   model?: string
   tone?: string
-  length?: string
+  /** 前端滑块值 0~100（步长 25） */
+  length?: number
   language?: string
-  /** 已存在的正文（续写） */
+  /** 已存在的正文（完整 Markdown） */
   contextText?: string
+  /**
+   * 对话历史：[{role: 'user' | 'assistant', content: string}, ...]
+   * AI 通过它"记住"之前几轮做了什么，避免每次都从零续写
+   */
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>
 }
 
 export interface RewriteInput {
@@ -55,11 +66,11 @@ export interface TranslateInput {
 
 function buildSystem(opts: {
   tone?: string
-  length?: string
+  length?: number
   language?: string
 }): string {
   const tone = TONE_DESC[opts.tone ?? 'formal']
-  const length = LENGTH_DESC[opts.length ?? 'medium']
+  const length = lengthToText(opts.length ?? 50)
   const lang = LANG_DESC[opts.language ?? 'zh']
   return [
     '你是 aiWord 的写作助手，用户正编辑一份 Markdown 文档。',
@@ -73,6 +84,7 @@ function buildSystem(opts: {
 
 /**
  * 通用业务方法：拿 provider，调 stream()，把增量喂给 onChunk 回调。
+ * `model` 是前端下拉的 model id，会通过 resolveModel 映射成 provider 实际期望的名字。
  */
 async function streamWith(
   messages: Message[],
@@ -83,7 +95,7 @@ async function streamWith(
   const provider = getProvider()
   const { text, tokens } = await provider.stream(
     {
-      model: model ?? 'claude-sonnet',
+      model: resolveModel(model ?? ''),
       system,
       messages,
       temperature: 0.7,
@@ -104,11 +116,40 @@ export async function runGenerate(
     language: input.language
   })
 
+  // 关键 prompt：让 AI 每次都返回"完整新文档"，而不是片段
+  // 这样前端拿到结果后直接替换 doc.content，不会越堆越长
   const userText = input.contextText
-    ? `以下是目前已有的内容（Markdown）：\n\n${input.contextText}\n\n请基于它${input.prompt || '续写/扩展/优化'}：`
-    : input.prompt || '自由发挥'
+    ? `以下是当前文档的完整 Markdown 内容：
 
-  return streamWith([{ role: 'user', content: userText }], system, onChunk, input.model)
+\`\`\`markdown
+${input.contextText}
+\`\`\`
+
+用户当前的指令：${input.prompt || '请基于以上内容继续完善'}
+
+要求：
+1. 严格按照用户指令对文档做整体性修改（缩短/扩写/润色/加结论/修语法 等）
+2. 返回的是**完整的新文档**（Markdown 全文），不是片段、不是 diff、不是追加
+3. 不要解释、不要寒暄、不要输出 \`\`\`markdown\`\`\` 围栏，直接给正文
+4. 如果用户指令与文档内容无关（如"写个新章节"），把新内容合理插入到合适位置，并保留原文档其余部分`
+    : `用户指令：${input.prompt || '请自由发挥，写一篇 Markdown 文章'}
+
+要求：
+1. 返回完整的 Markdown 文档全文
+2. 不要解释、不要寒暄、不要围栏`
+
+  // 组装消息：历史 + 当前指令
+  const messages: Message[] = []
+  if (input.history?.length) {
+    for (const m of input.history) {
+      if (m.role === 'user' || m.role === 'assistant') {
+        messages.push({ role: m.role, content: m.content })
+      }
+    }
+  }
+  messages.push({ role: 'user', content: userText })
+
+  return streamWith(messages, system, onChunk, input.model)
 }
 
 export async function runRewrite(
