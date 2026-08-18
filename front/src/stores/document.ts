@@ -75,6 +75,70 @@ export type AiIntent = 'edit' | 'analyze' | 'chat'
 
 const INTENT_RE = /^\s*\[INTENT:(edit|analyze|chat)\]\s*/i
 
+/**
+ * 一条"可点击选项"：AI 用 markdown 列表输出"**路径 X**：描述"，
+ * 前端解析后渲染成按钮，点击即可一键续聊。
+ */
+export interface ChatChoice {
+  /** 选项 key（'A' / 'B' / 'C' / 'D'） */
+  key: string
+  /** 选项标签，例如"路径 A" */
+  label: string
+  /** 选项简短描述（按钮文字） */
+  description: string
+}
+
+/**
+ * 从一段 AI 回复里识别选项列表。
+ *
+ * AI 输出经常不规范，所以按"宽容度从高到低"试 3 种格式（命中其一即可）：
+ *   1. markdown bullet + bold：`- **路径 A**：描述`
+ *   2. 仅 bold：`**路径 A**：描述`
+ *   3. 纯文本：`路径 A：描述` / `路径 A: 描述`
+ *
+ * 标签同义词：AI 会根据语境挑顺眼的词，"路径/方案/选项/思路/方向/建议" 都视为同一种标签。
+ * 分隔符同时接受 ASCII 半角 ":" 和中文全角 "："（AI 倾向用全角）。
+ *
+ * - key 必须是 A/B/C/D 大写字母
+ * - description 截断 80 字防溢出
+ * - 同一 key 取最先出现的；最多 8 个（理论上 AI 只给 2~4 个）
+ */
+export function parseChoices(content: string): ChatChoice[] {
+  const choices: ChatChoice[] = []
+  // AI 在不同语境下会用不同近义词，全收进来避免漏匹配
+  const KEYWORDS = '(?:路径|方案|选项|思路|方向|建议|选择|模式|Path|Option|Idea|Approach)'
+  // ":" = ASCII 半角；"：" (U+FF1A) = 中文全角。AI 在中文写作里几乎都用全角
+  const SEP = '[:：]'
+  const PATTERNS: RegExp[] = [
+    // 1. markdown bullet + bold： "- **路径 A**：..."
+    new RegExp(`^\\s*[-*]\\s+\\*\\*\\s*${KEYWORDS}\\s+([A-Da-d])\\s*\\*\\*\\s*${SEP}\\s*([^\\n]+)`, 'gm'),
+    // 2. 仅 bold："**路径 A**：..."
+    new RegExp(`\\*\\*\\s*${KEYWORDS}\\s+([A-Da-d])\\s*\\*\\*\\s*${SEP}\\s*([^\\n]+)`, 'g'),
+    // 3. 纯文本：行首"路径 A：..." / "路径 A: ..."，可选前导 -/*
+    new RegExp(`^\\s*(?:[-*]\\s*)?${KEYWORDS}\\s+([A-Da-d])\\s*${SEP}\\s*([^\\n]+)`, 'gm')
+  ]
+
+  const seen = new Set<string>()
+  for (const re of PATTERNS) {
+    let m: RegExpExecArray | null
+    while ((m = re.exec(content)) !== null) {
+      const key = m[1].toUpperCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      // 去掉描述里残留的 ** / * 等 markdown 符号
+      const desc = m[2].trim().replace(/\*\*/g, '').replace(/^\*+/, '').slice(0, 80)
+      choices.push({
+        key,
+        label: `路径 ${key}`,
+        description: desc
+      })
+      if (choices.length >= 8) break
+    }
+    if (choices.length >= 2) break
+  }
+  return choices
+}
+
 /** 平台显示元数据，供左/右栏复用 */
 export const PLATFORMS: { key: Platform; label: string; color: string }[] = [
   { key: 'wechat', label: '微信公众号', color: 'var(--color-wechat)' },
@@ -297,11 +361,19 @@ export const useDocumentStore = defineStore('document', () => {
    * 每篇文档独立的"AI 对话历史"：让 AI 记住之前几轮做过什么，
    * 避免每次都从零开始、也不重复堆内容。
    * - 喂回后端的内容：[{role, content, kind}]
-   *   - kind='edit' → AI 之前给出过"完整新文档"
-   *   - kind='chat' → AI 之前的聊天回复
+   *   - kind='edit'    → AI 之前给出过"完整新文档"
+   *   - kind='analyze' → AI 之前的评价/建议
+   *   - kind='chat'    → AI 之前的聊天回复
    */
   const chatHistory = ref<
-    Map<string, Array<{ role: 'user' | 'assistant'; content: string; kind?: 'edit' | 'chat' }>>
+    Map<
+      string,
+      Array<{
+        role: 'user' | 'assistant'
+        content: string
+        kind?: 'edit' | 'analyze' | 'chat'
+      }>
+    >
   >(new Map())
 
   /**
@@ -446,10 +518,13 @@ export const useDocumentStore = defineStore('document', () => {
 
   /**
    * 一键生成：POST /api/ai/generate（SSE）。
-   * - AI 收到对话历史 + 当前文档，**自己判断**是要改文档（[INTENT:edit]）还是只是问答（[INTENT:chat]）
+   * - AI 收到对话历史 + 当前文档，**自己判断**意图（除非传了 forceMode 强制）
+   *   - [INTENT:edit]    → 直接修改文档
+   *   - [INTENT:analyze] → 给评价/建议，不动文档
+   *   - [INTENT:chat]    → 闲聊/问答/反问澄清
    * - 流式过程：先 buffer，等待意图标签出现；标签一出现立刻分流到不同 UI
-   *   - edit：进入 pendingDiff 走"接受/拒绝"流程（保留 doc.content）
-   *   - chat：直接追加到 chatThread，给用户聊天气泡
+   *   - edit：进入 pendingDiff 走"接受/拒绝"流程
+   *   - analyze/chat：直接追加到 chatThread，给用户聊天气泡
    * - 意图识别失败的兜底：按 edit 走（兼容老行为）
    *
    * 返回 { content, mode }：mode 给调用方做后续 UI 提示（如 toast）用，
@@ -470,24 +545,78 @@ export const useDocumentStore = defineStore('document', () => {
     // contentBuffer 是去掉 [INTENT:xxx] 后真正展示/处理的内容
     let rawBuffer = ''
     let contentBuffer = ''
-    let detected: AiIntent | null = null
+    let detected: AiIntent | null = opts.forceMode ?? null
 
     // 打开"实时预览"，先以未识别状态启动
+    // 如果 forceMode 已指定，preview.mode 直接给定（避免流式中闪"未识别"）
     streamingPreview.value = {
       docId: doc.id,
       preContent: baseContent,
       accumulated: '',
       rawBuffer: '',
-      mode: null,
+      mode: detected,
       prompt: opts.prompt ?? ''
     }
 
-    // 从一段文本里识别 [INTENT:edit] / [INTENT:chat]；识别到就剥掉前缀
+    // 从一段文本里识别 [INTENT:edit|analyze|chat]；识别到就剥掉前缀
     function matchIntent(text: string): { intent: AiIntent | null; rest: string } {
       const m = text.match(INTENT_RE)
       if (!m) return { intent: null, rest: text }
       const intent = m[1].toLowerCase() as AiIntent
       return { intent, rest: text.slice(m[0].length) }
+    }
+
+    /**
+     * AI 漏标 [INTENT:xxx] 时的内容兜底：
+     * 在开头若干字符里如果出现"不动文档 / 按 chat 处理 / 闲聊回应 / 不修改当前文档"
+     * 等元评论短语 → 视为 [INTENT:chat]，避免把 AI 的解释+正文一起当作 edit 落到 pendingDiff
+     *
+     * 扫描窗口放宽到 1500 字，模式做宽容处理（覆盖 "不动文档" / "不会动文档" /
+     * "不会动这份文档" / "不会改当前文档" / "不修改文档" 等变体）。
+     * 同时检测 `----` 分隔符（系统提示里明令禁止的"前半说明、后半正文"写法）。
+     */
+    function inferIntentFromContent(text: string): AiIntent {
+      const head = text.slice(0, 1500)
+
+      // 1) 出现 `----` 分隔符就视为 chat：AI 在用禁止写法，整篇都得当 chat 处理
+      if (/[\s\n]-{3,}[\s\n]/.test(head)) return 'chat'
+
+      // 2) "不动文档 / 不修改文档 / 不会动这份文档" 等"拒绝改动"的元评论
+      const chatMarkers: RegExp[] = [
+        // "不动文档" / "不动当前文档" / "不动这份文档"
+        /不\s*动\s*[这篇份到个]?\s*\S{0,6}?文档/,
+        // "不会动文档" / "不会改文档" / "不会修改文档" / "不会动当前文档" / "不会动这份文档"
+        /不\s*会?\s*[动改修改]\s*[这篇份到个]?\s*\S{0,6}?文档/,
+        // "不修改文档" / "不修改当前文档"
+        /不\s*修改\s*[这篇份到个]?\s*\S{0,6}?文档/,
+        // "本次不动文档" / "本轮不动文档" / "这一轮不动文档"
+        /(?:本次?|本轮|这[一轮次]|这一轮)\s*(?:不|没)\s*(?:会|要)?\s*[动改修改]\s*[这篇份到个]?\s*\S{0,6}?文档/,
+        // "我不动文档" / "我不动当前文档"
+        /我\s*(?:不|没)\s*(?:会|要)?\s*[动改修改]\s*[这篇份到个]?\s*\S{0,6}?文档/,
+        // "按 chat 处理" / "按 chat 模式" / "按 chat 回应"
+        /按\s*["“]?\s*chat\s*["”]?\s*(?:模式|处理|回应)/i,
+        // "按闲聊回应" / "按闲聊处理"
+        /按\s*["“]?\s*闲聊/,
+        // "跟当前这份小说大纲没关系" / "跟当前文档主题无关"
+        /(?:跟|和|与)\s*当前\s*[这篇份个]?\S{0,30}?(?:没关系|无关|不[同关])/,
+        // "与当前文档主题无关" / "跟当前文档主题无关"
+        /(?:跟|和|与)\s*当前\s*文档\s*(?:主题\s*)?(?:无关|没关系|不[同关])/,
+        // "主题不相关" / "主题不一样"
+        /主题\s*不(?:同|相关|一样)/,
+        // "本次回答不会改动文档" —— 长前缀版本
+        /(?:本次?|这[一轮次])?\s*(?:回答|回复|输出)?\s*(?:不|没)\s*(?:会|要)?\s*[动改修改]\s*[这篇份到个]?\s*\S{0,6}?文档/
+      ]
+      for (const re of chatMarkers) {
+        if (re.test(head)) return 'chat'
+      }
+
+      // 3) AI 自相矛盾：同一段里既有"我会改/重新输出完整文档"也有"我不会动文档"
+      // → 视为 chat（AI 没拿定主意，宁可不动文档也别让用户误接受）
+      const willModify = /(?:我会|我将|我准备|扩展人物|重新输出完整文档|改写文档|润色文档|扩写文档|缩写文档|完整新文档|完整文档)/
+      const wontModify = /(?:不会动文档|不修改文档|不动文档|不会改文档)/
+      if (willModify.test(head) && wontModify.test(head)) return 'chat'
+
+      return 'edit'
     }
 
     // 更新 streamingPreview（一次性塞新对象，触发响应式）
@@ -499,6 +628,37 @@ export const useDocumentStore = defineStore('document', () => {
         rawBuffer,
         mode: detected
       }
+    }
+
+    // 把消息写进 chatThread + chatHistory 的通用动作
+    function recordConversation(
+      userPrompt: string,
+      aiContent: string,
+      kind: AiIntent
+    ) {
+      const userMsg: ChatMessage = {
+        id: `u-${Date.now()}`,
+        role: 'user',
+        content: userPrompt,
+        ts: Date.now()
+      }
+      const aiMsg: ChatMessage = {
+        id: `a-${Date.now() + 1}`,
+        role: 'assistant',
+        content: aiContent,
+        kind,
+        ts: Date.now() + 1
+      }
+      const next = new Map(chatThread.value)
+      next.set(doc.id, [...(next.get(doc.id) ?? []), userMsg, aiMsg])
+      chatThread.value = next
+
+      const histNext = new Map(chatHistory.value)
+      const histList = [...(histNext.get(doc.id) ?? [])]
+      histList.push({ role: 'user', content: userPrompt })
+      histList.push({ role: 'assistant', content: aiContent, kind })
+      histNext.set(doc.id, histList.slice(-20))
+      chatHistory.value = histNext
     }
 
     try {
@@ -545,52 +705,26 @@ export const useDocumentStore = defineStore('document', () => {
             detected = intent
             contentBuffer = rest
           } else {
-            // 兜底：完全没标签视为 edit（老行为）
-            detected = 'edit'
+            // 兜底：AI 没标 [INTENT:xxx]，按内容里是否出现"不动文档"等元评论来兜底分流
+            detected = inferIntentFromContent(rawBuffer)
             contentBuffer = rawBuffer
           }
         }
         pushPreview()
       }
 
-      // user 消息：进入 chatThread（编辑和聊天模式都展示，让用户看到自己刚才说了啥）
-      const userMsg: ChatMessage = {
-        id: `u-${Date.now()}`,
-        role: 'user',
-        content: opts.prompt ?? '',
-        ts: Date.now()
-      }
-      const userThread = [...(chatThread.value.get(doc.id) ?? []), userMsg]
+      const finalMode: AiIntent = detected ?? 'edit'
 
-      if (detected === 'chat') {
-        // ============ 聊天模式：直接追加 AI 消息，不动文档 ============
-        const aiMsg: ChatMessage = {
-          id: `a-${Date.now()}`,
-          role: 'assistant',
-          content: contentBuffer,
-          kind: 'chat',
-          ts: Date.now()
-        }
-        const next = new Map(chatThread.value)
-        next.set(doc.id, [...userThread, aiMsg])
-        chatThread.value = next
-
-        // 同时进 chatHistory（喂回 AI 用），区分 kind='chat'
-        const histNext = new Map(chatHistory.value)
-        const histList = [...(histNext.get(doc.id) ?? [])]
-        histList.push({ role: 'user', content: userMsg.content })
-        histList.push({ role: 'assistant', content: contentBuffer, kind: 'chat' })
-        histNext.set(doc.id, histList.slice(-20))
-        chatHistory.value = histNext
-
+      // ============ analyze / chat：直接进 chatThread，不动文档 ============
+      if (finalMode === 'analyze' || finalMode === 'chat') {
+        recordConversation(opts.prompt ?? '', contentBuffer, finalMode)
         streamingPreview.value = null
-        return { content: contentBuffer, mode: 'chat' }
+        return { content: contentBuffer, mode: finalMode }
       }
 
-      // ============ 编辑模式：进入 pendingDiff 等用户接受/拒绝 ============
+      // ============ edit：进入 pendingDiff 等用户接受/拒绝 ============
       // 计算行级 diff，给 UI 展示"AI 改了哪些行"
-      const postContent =
-        detected === 'edit' ? contentBuffer : contentBuffer || rawBuffer
+      const postContent = contentBuffer || rawBuffer
       const diffParts = diffLines(baseContent, postContent)
 
       streamingPreview.value = null
@@ -602,11 +736,7 @@ export const useDocumentStore = defineStore('document', () => {
         prompt: opts.prompt ?? ''
       }
 
-      // 注意：edit 模式下 user/AI 消息现在不进 chatThread，等用户点"接受"再追加
-      // 拒绝则整个这一轮都没发生过；这样符合用户对"接受/拒绝"操作的心智模型
-      // 但 user 消息可以单独先展示（只是让他看到自己刚才问的啥）—— 这里选择不展示，更纯粹
-      void userThread
-
+      // edit 模式下 user/AI 消息不在这里加，等用户点"接受"再追加（拒绝则整个一轮都不算）
       return { content: postContent, mode: 'edit' }
     } catch (err) {
       // 出错时也清掉实时预览，避免残留
@@ -715,6 +845,50 @@ export const useDocumentStore = defineStore('document', () => {
     return changed
   }
 
+  /**
+   * 把 AI 的"建议"消息一键应用到文档：
+   * - 找到这条 assistant 消息之前的 user prompt，拼出明确的"按建议改"指令
+   * - 强制走 edit 流程（forceMode='edit'），让用户能看到 diff 决定是否接受
+   * - 应用前在 chatThread 留个占位说明，避免用户忘了刚才点了什么
+   */
+  async function applySuggestion(analyzeMsgId: string, docId: string) {
+    const thread = chatThread.value.get(docId) ?? []
+    const idx = thread.findIndex((m) => m.id === analyzeMsgId)
+    if (idx < 0) return
+    const msg = thread[idx]
+    if (msg.role !== 'assistant') return
+
+    // 找到这条之前最近的 user 消息作为上下文
+    let userPrompt = ''
+    for (let i = idx - 1; i >= 0; i--) {
+      if (thread[i].role === 'user') {
+        userPrompt = thread[i].content
+        break
+      }
+    }
+
+    const suggestion = msg.content
+    const editPrompt = userPrompt
+      ? `按你刚才的建议修改文档。\n\n原问题：${userPrompt}\n\n建议：${suggestion}`
+      : `按以下建议修改文档：\n\n${suggestion}`
+
+    // 在 chatThread 留一个"用户已确认应用"的提示，避免与 pendingDiff 失联
+    const notice: ChatMessage = {
+      id: `apply-${Date.now()}`,
+      role: 'user',
+      content: '↪ 按上面建议修改文档',
+      ts: Date.now()
+    }
+    const next = new Map(chatThread.value)
+    next.set(docId, [...(next.get(docId) ?? []), notice])
+    chatThread.value = next
+
+    await generate({
+      prompt: editPrompt,
+      forceMode: 'edit'
+    })
+  }
+
   return {
     documents,
     documentsLoaded,
@@ -746,6 +920,7 @@ export const useDocumentStore = defineStore('document', () => {
     clearChatHistory,
     acceptPendingDiff,
     rejectPendingDiff,
+    applySuggestion,
     togglePlatform,
     generate
   }

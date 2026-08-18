@@ -7,11 +7,19 @@ import {
   Bell,
   ChatDotRound,
   Delete,
-  Check
+  Check,
+  EditPen,
+  Promotion,
+  Close
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MarkdownIt from 'markdown-it'
-import { useDocumentStore, type ChatMessage } from '@/stores/document'
+import {
+  useDocumentStore,
+  type ChatMessage,
+  type ChatChoice,
+  parseChoices
+} from '@/stores/document'
 import { api, ApiError } from '@/services/api'
 import PlatformChips from './PlatformChips.vue'
 
@@ -79,6 +87,71 @@ const streamingChatText = computed(() => {
   if (!isChatStreaming.value || !sp) return ''
   return sp.accumulated
 })
+
+/**
+ * "AI 选项"弹窗：当 AI 的回复里能解析出"路径 A/B/C"等选项时，
+ * 自动弹出独立的居中弹窗让用户一键挑一个继续聊。
+ * 不再把按钮塞进聊天气泡里，避免挤压气泡布局 / 文字穿透。
+ */
+const activeChoiceMsgId = ref<string | null>(null)
+
+/** 找出当前正在弹的选项所属的消息 */
+const activeChoiceMsg = computed<ChatMessage | null>(() => {
+  const id = activeChoiceMsgId.value
+  if (!id) return null
+  return chatMessages.value.find((m) => m.id === id) ?? null
+})
+
+/** 当前弹窗里要展示的选项列表（来自对应消息的正文） */
+const activeChoices = computed<ChatChoice[]>(() => {
+  const m = activeChoiceMsg.value
+  if (!m) return []
+  return choicesOf(m)
+})
+
+/**
+ * el-dialog 用 v-model 控制开关。包一层 computed 把"是否有活跃选项"映射成 boolean，
+ * 用户点 X / 遮罩 / Esc 关闭时（el-dialog 会把 modelValue 置 false）→ 同步清掉 activeChoiceMsgId。
+ */
+const choiceDialogOpen = computed<boolean>({
+  get: () => activeChoiceMsgId.value !== null,
+  set: (open) => {
+    if (!open) activeChoiceMsgId.value = null
+  }
+})
+
+/** 关闭选项弹窗（用户点 X 或遮罩） */
+function dismissChoice() {
+  activeChoiceMsgId.value = null
+}
+
+/** 用户在弹窗里挑了一个选项：先关弹窗，再把选项当下一轮 prompt 发出去 */
+async function pickChoice(c: ChatChoice) {
+  activeChoiceMsgId.value = null
+  await handleChoice(c)
+}
+
+/**
+ * 监听聊天列表变化：
+ * - 当新追加的 assistant 消息（kind=chat）里能解析出选项时，自动弹出选项弹窗
+ * - 这样用户不用先去气泡里找按钮，AI 给了选择就直接弹出来
+ */
+watch(
+  () => chatMessages.value.map((m) => `${m.role}:${m.kind ?? ''}:${m.id}`).join('|'),
+  () => {
+    // 已经在生成时不要抢戏（用户正在等 AI 回复，避免弹窗反复抖动）
+    if (store.isGenerating) return
+    const thread = chatMessages.value
+    for (let i = thread.length - 1; i >= 0; i--) {
+      const m = thread[i]
+      if (m.role === 'assistant' && m.kind === 'chat' && choicesOf(m).length >= 1) {
+        // 已经为这条消息弹过就不再重复弹（id 不一致才更新）
+        if (activeChoiceMsgId.value !== m.id) activeChoiceMsgId.value = m.id
+        return
+      }
+    }
+  }
+)
 
 /** 聊天列表滚动容器 */
 const chatListRef = ref<HTMLElement | null>(null)
@@ -215,6 +288,61 @@ async function handlePublish() {
 /** 给一段 markdown 字符串生成 HTML（聊天气泡用） */
 function renderMd(text: string): string {
   return md.render(text || '')
+}
+
+/**
+ * 处理"应用到文档"按钮：把 AI 的建议作为 edit 指令重新发起生成。
+ * - 用户已经在建议气泡里看到了评价；点这个 = 同意按建议改
+ * - 走 forceMode='edit'，所以会进 pendingDiff 而不是再走一次 analyze
+ */
+async function handleApplySuggestion(msg: ChatMessage) {
+  if (!store.current) {
+    ElMessage.warning('请先选择或创建文档')
+    return
+  }
+  if (store.isGenerating) return
+  try {
+    await store.applySuggestion(msg.id, store.current.id)
+    ElMessage.success('已按建议重写，请在编辑器审阅改动 ✦')
+  } catch (e) {
+    const errMsg = e instanceof ApiError ? `${e.code} · ${e.message}` : '应用失败，请稍后再试'
+    ElMessage.error(errMsg)
+  }
+}
+
+/**
+ * 用户点击 AI 给出的某个"路径 X"按钮：直接把 key 作为下一轮 prompt 发出去。
+ * - AI 在历史里能看到"上一轮我给 A/B/C，用户选了 X"，所以传短 key 即可
+ * - 不走 prompt 输入框，绕过用户手动复制粘贴
+ */
+async function handleChoice(choice: ChatChoice) {
+  if (!store.current) {
+    ElMessage.warning('请先选择或创建文档')
+    return
+  }
+  if (store.isGenerating) return
+  try {
+    await store.generate({
+      prompt: `${choice.label}`,
+      model: model.value,
+      tone: tone.value,
+      length: length.value,
+      language: language.value
+    })
+  } catch (e) {
+    const errMsg = e instanceof ApiError ? `${e.code} · ${e.message}` : '续聊失败，请稍后再试'
+    ElMessage.error(errMsg)
+  }
+}
+
+/**
+ * 计算某条 AI 消息里可解析的选项。
+ * 只对 chat / analyze 两种非编辑类消息生效（编辑类已经在 diff 流程里）。
+ */
+function choicesOf(msg: ChatMessage): ChatChoice[] {
+  if (msg.role !== 'assistant') return []
+  if (msg.kind === 'edit') return []
+  return parseChoices(msg.content)
 }
 </script>
 
@@ -360,6 +488,44 @@ function renderMd(text: string): string {
               </div>
             </template>
 
+            <!-- AI 评价/建议（不动文档，带"应用到文档"按钮） -->
+            <template v-else-if="msg.kind === 'analyze'">
+              <div class="bubble bubble--ai bubble--analyze">
+                <div class="bubble__avatar bubble__avatar--analyze">
+                  <el-icon><EditPen /></el-icon>
+                </div>
+                <div class="bubble__content markdown-body" v-html="renderMd(msg.content)" />
+                <!-- AI 给出的可点击选项（"路径 A/B/C"） -->
+                <div
+                  v-if="choicesOf(msg).length"
+                  class="choice-list"
+                >
+                  <div class="choice-list__hint">↳ 点击下方按钮一键回复</div>
+                  <button
+                    v-for="c in choicesOf(msg)"
+                    :key="c.key"
+                    class="choice-btn"
+                    type="button"
+                    :disabled="store.isGenerating"
+                    @click="handleChoice(c)"
+                  >
+                    <span class="choice-btn__key">{{ c.label }}</span>
+                    <span class="choice-btn__desc">{{ c.description }}</span>
+                  </button>
+                </div>
+                <button
+                  class="apply-btn"
+                  type="button"
+                  :disabled="store.isGenerating"
+                  @click="handleApplySuggestion(msg)"
+                  title="让 AI 按这条建议改文档（进入 diff 流程）"
+                >
+                  <el-icon><Promotion /></el-icon>
+                  <span>应用到文档</span>
+                </button>
+              </div>
+            </template>
+
             <!-- AI 编辑消息 -->
             <template v-else>
               <div class="bubble bubble--ai bubble--edit">
@@ -412,6 +578,55 @@ function renderMd(text: string): string {
         </p>
       </section> -->
     </div>
+
+    <!--
+      AI 选项弹窗（fixed 居中）：
+      - 当 AI 的 chat 类回复里能解析出"路径 A/B/C..."时自动弹出
+      - 点哪个选项就把哪条 label 当下一轮 prompt 发出去
+      - 点 X / 点遮罩 / 按 Esc 关闭
+      - 用 el-dialog 自带 modal 遮罩 + ESC + 锁滚动，比自造 mask 更省心
+    -->
+    <el-dialog
+      v-model="choiceDialogOpen"
+      title="AI 给你的几个方向"
+      width="min(480px, 92vw)"
+      :close-on-click-modal="true"
+      :close-on-press-escape="true"
+      :modal="true"
+      :show-close="false"
+      align-center
+      custom-class="choice-dialog"
+      @close="dismissChoice"
+    >
+      <p class="choice-dialog__sub">挑一个直接继续聊，或点关闭自己写</p>
+      <div class="choice-dialog__list">
+        <button
+          v-for="c in activeChoices"
+          :key="c.key"
+          class="choice-btn choice-btn--modal"
+          type="button"
+          :disabled="store.isGenerating"
+          @click="pickChoice(c)"
+        >
+          <span class="choice-btn__key">{{ c.label }}</span>
+          <span class="choice-btn__desc">{{ c.description }}</span>
+        </button>
+      </div>
+      <template #header>
+        <div class="choice-dialog__head">
+          <el-icon class="choice-dialog__icon"><MagicStick /></el-icon>
+          <span>AI 给你的几个方向</span>
+          <button
+            class="choice-dialog__close"
+            type="button"
+            aria-label="关闭"
+            @click="dismissChoice"
+          >
+            <el-icon><Close /></el-icon>
+          </button>
+        </div>
+      </template>
+    </el-dialog>
   </aside>
 </template>
 
@@ -736,6 +951,189 @@ function renderMd(text: string): string {
 }
 .bubble--edit .bubble__avatar {
   background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+}
+
+/* analyze（评价/建议）气泡：紫色系，含"应用到文档"按钮 */
+.bubble--analyze {
+  flex-direction: column;
+  align-items: stretch;
+  background: linear-gradient(
+    135deg,
+    rgba(168, 85, 247, 0.08) 0%,
+    rgba(99, 102, 241, 0.08) 100%
+  );
+  border: 1px solid rgba(168, 85, 247, 0.25);
+}
+.bubble--analyze > .bubble__avatar {
+  display: none;
+}
+.bubble--analyze::before {
+  content: 'AI 建议';
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  color: #7c3aed;
+  background: rgba(168, 85, 247, 0.12);
+  padding: 1px 6px;
+  border-radius: 4px;
+  width: fit-content;
+  margin-bottom: 4px;
+}
+.bubble__avatar--analyze {
+  background: linear-gradient(135deg, #a855f7 0%, #7c3aed 100%) !important;
+}
+.apply-btn {
+  margin-top: 6px;
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: linear-gradient(135deg, #a855f7 0%, #7c3aed 100%);
+  border: none;
+  border-radius: 999px;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+  box-shadow: 0 3px 10px rgba(124, 58, 237, 0.28);
+}
+.apply-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 5px 14px rgba(124, 58, 237, 0.4);
+}
+.apply-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* AI 给出的可点击选项（路径 A/B/C...） */
+.choice-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
+}
+.choice-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid var(--color-brand);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-family: inherit;
+}
+.choice-btn:hover:not(:disabled) {
+  background: var(--color-brand);
+  color: #fff;
+  transform: translateX(2px);
+}
+.choice-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.choice-btn__key {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--color-brand);
+}
+.choice-btn:hover:not(:disabled) .choice-btn__key {
+  color: #fff;
+}
+.choice-btn__desc {
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+.choice-btn:hover:not(:disabled) .choice-btn__desc {
+  color: rgba(255, 255, 255, 0.92);
+}
+
+/* ============================================================
+ * "AI 选项" 居中弹窗（el-dialog）
+ * - 不再用 inline 按钮，避免挤气泡布局
+ * - 按钮填满弹窗宽度，整体感更强
+ * ============================================================ */
+.choice-dialog {
+  border-radius: 14px;
+  overflow: hidden;
+}
+.choice-dialog .el-dialog__header {
+  padding: 0;
+  margin: 0;
+}
+.choice-dialog .el-dialog__body {
+  padding: 14px 18px 18px;
+}
+.choice-dialog__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 18px;
+  background: linear-gradient(
+    135deg,
+    var(--color-accent-from) 0%,
+    var(--color-accent-to) 100%
+  );
+  color: #fff;
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+.choice-dialog__icon {
+  font-size: 18px;
+}
+.choice-dialog__close {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  transition: background 0.15s ease;
+}
+.choice-dialog__close:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+}
+.choice-dialog__sub {
+  margin: 0 0 12px;
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.choice-dialog__list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+/* 弹窗里的按钮：填满宽度 + 更显眼的边框/阴影 */
+.choice-btn--modal {
+  width: 100%;
+  align-items: stretch;
+  background: #fff;
+  border: 1px solid var(--color-brand);
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: var(--fs-sm);
+  box-shadow: 0 1px 3px rgba(99, 102, 241, 0.08);
+}
+.choice-btn--modal:hover:not(:disabled) {
+  background: var(--color-brand);
+  color: #fff;
+  transform: translateX(2px);
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.25);
 }
 .bubble__content--edit {
   display: flex;
