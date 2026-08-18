@@ -92,6 +92,11 @@ export const documents = mysqlTable('documents', {
   content: text('content'),
   /** 逗号分隔：wechat,zhihu,csdn,juejin */
   platforms: varchar('platforms', { length: 64 }).default(''),
+  /**
+   * 软删除时间戳：null = 正常文档，非 null = 已删除（进入回收站）。
+   * 物理删除仅在超过保留期（30 天）后由 purgeOldDocuments 清理。
+   */
+  deletedAt: timestamp('deleted_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at')
     .defaultNow()

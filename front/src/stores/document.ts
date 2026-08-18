@@ -13,6 +13,11 @@ export interface DocumentItem {
   content: string
   updatedAt: string // ISO
   platforms: Platform[]
+  /**
+   * 软删除时间戳：null = 正常文档；非 null = 在回收站里。
+   * 回收站里的文档只在"删除后的 30 天"内可见，到期后由后端定时清理。
+   */
+  deletedAt: string | null
   /** 后端用户隔离字段，方便后续扩展；前端一般不用 */
   userId?: number
 }
@@ -158,13 +163,15 @@ interface ApiDocument {
   platforms: string[]
   createdAt: Date | string
   updatedAt: Date | string
+  /** 后端最新 schema 已下发 deletedAt；老版本接口可能没有，做可选 */
+  deletedAt?: Date | string | null
   userId: number
 }
 
 /**
  * 后端 DocumentRow → 前端 DocumentItem 转换：
  * - id 已经 string 化（listDocuments 直接转过）
- * - updatedAt 是 Date，转成 ISO 字符串，跟旧前端约定保持一致
+ * - updatedAt / deletedAt 是 Date，转成 ISO 字符串，跟旧前端约定保持一致
  */
 function fromApi(doc: ApiDocument): DocumentItem {
   return {
@@ -177,8 +184,17 @@ function fromApi(doc: ApiDocument): DocumentItem {
       doc.updatedAt instanceof Date
         ? doc.updatedAt.toISOString()
         : String(doc.updatedAt),
+    deletedAt: toIso(doc.deletedAt),
     userId: doc.userId
   }
+}
+
+/** 把 Date / string / null / undefined 都规范成 ISO 字符串或 null */
+function toIso(v: Date | string | null | undefined): string | null {
+  if (v === undefined || v === null) return null
+  if (v instanceof Date) return v.toISOString()
+  const s = String(v)
+  return s === '' ? null : s
 }
 
 const seedTemplates: TemplateItem[] = []
@@ -187,6 +203,14 @@ export const useDocumentStore = defineStore('document', () => {
   const documents = ref<DocumentItem[]>([])
   const documentsLoaded = ref(false)
   const documentsLoading = ref(false)
+  /**
+   * 回收站文档（软删除但未到 30 天清理期）。
+   * - 与 `documents` 完全隔离，不参与"最近"列表展示
+   * - 仅在用户点开回收站时才拉取
+   */
+  const deletedDocuments = ref<DocumentItem[]>([])
+  const deletedLoaded = ref(false)
+  const deletedLoading = ref(false)
   const templates = ref<TemplateItem[]>(seedTemplates)
   const templatesLoaded = ref(false)
   const templatesLoading = ref(false)
@@ -215,22 +239,24 @@ export const useDocumentStore = defineStore('document', () => {
   function createNew(): string {
     // 本地先建一个占位条目，立刻给 UI 用 —— 避免接口往返的卡顿感
     const id = `local-${Date.now()}`
-    const title = `未命名文档-${documents.value.length + 1}`
+    // 真正的空文档：title / content 都为空，编辑器自身的 placeholder（"开始写点什么……"）
+    // 和 title input 的 placeholder（"无标题文档"）负责给用户视觉提示
     const item: DocumentItem = {
       id,
-      title,
-      excerpt: '开始记录你的想法……',
-      content: `# ${title}\n\n开始写点什么吧……\n`,
+      title: '',
+      excerpt: '',
+      content: '',
       updatedAt: nowISO(),
-      platforms: []
+      platforms: [],
+      deletedAt: null
     }
     documents.value.unshift(item)
     currentId.value = id
     // 异步落库；用真正的后端 id 替换占位 id
     api
       .post<ApiDocument>('/api/documents', {
-        title,
-        content: item.content
+        title: '',
+        content: ''
       })
       .then((doc) => {
         const remote = fromApi(doc)
@@ -260,6 +286,65 @@ export const useDocumentStore = defineStore('document', () => {
           console.error('[rename] persist failed', e)
         })
       }
+    }
+  }
+
+  /**
+   * 删除一篇文档（**软删除**）：
+   * - 后端只标记 deletedAt，**不会真从数据库抹掉**（用户在回收站可恢复，30 天后自动清理）
+   * - 本地立刻从 `documents` 移除 + 推进 `deletedDocuments`（乐观更新，UI 不阻塞）
+   * - 后端 DELETE 失败时回滚（移到 trash 的动作回滚 + 重新放回 documents）
+   * - 若删的是当前打开的文档，把 currentId 切到下一篇（或 null）
+   * - 若当前正在保存它，先 flushPendingSaves 再删，避免竞态
+   * - 同步清掉它的 AI 对话历史/聊天流（避免留下指向不存在文档的状态）
+   */
+  async function deleteDocument(id: string): Promise<boolean> {
+    const idx = documents.value.findIndex((d) => d.id === id)
+    if (idx < 0) return false
+    const isNumeric = /^\d+$/.test(id)
+    const snapshot = documents.value[idx]
+    // 1) 先把当前正在防抖落库的数据 flush 出去，避免和 DELETE 抢同一行
+    if (isNumeric) flushPendingSaves()
+    // 2) 乐观更新：从 documents 移除，挪到 deletedDocuments 顶部
+    documents.value.splice(idx, 1)
+    const trashItem: DocumentItem = {
+      ...snapshot,
+      deletedAt: new Date().toISOString()
+    }
+    deletedDocuments.value.unshift(trashItem)
+    // 3) 若是当前打开的，切到下一篇（或 null）
+    if (currentId.value === id) {
+      const next = documents.value[idx] ?? documents.value[idx - 1] ?? null
+      currentId.value = next?.id ?? null
+    }
+    // 4) 顺手清掉它的 AI 历史 / 聊天流（回收站里没必要继续对话）
+    if (chatHistory.value.has(id)) {
+      const next = new Map(chatHistory.value)
+      next.delete(id)
+      chatHistory.value = next
+    }
+    if (chatThread.value.has(id)) {
+      const next = new Map(chatThread.value)
+      next.delete(id)
+      chatThread.value = next
+    }
+    // 5) 仅对已落库的文档（id 是数字串）请求后端软删
+    if (!isNumeric) {
+      // 本地占位（id=local-xxx）就不必上报，后端也没这条
+      deletedDocuments.value.shift()
+      return true
+    }
+    try {
+      await api.delete(`/api/documents/${id}`)
+      return true
+    } catch (e) {
+      console.error('[deleteDocument] failed', id, e)
+      // 失败回滚：从 deletedDocuments 移除，文档插回原位
+      const di = deletedDocuments.value.findIndex((d) => d.id === id)
+      if (di >= 0) deletedDocuments.value.splice(di, 1)
+      documents.value.splice(idx, 0, snapshot)
+      if (!currentId.value) currentId.value = id
+      throw e
     }
   }
 
@@ -447,6 +532,77 @@ export const useDocumentStore = defineStore('document', () => {
     }
   }
 
+  /**
+   * 拉取回收站列表（force 强制重拉，覆盖后台自动清理后的差异）。
+   * 失败时不抛错，UI 展示空数组 + 提示横幅即可。
+   */
+  async function loadDeletedDocuments(force = false) {
+    if (deletedLoading.value) return
+    if (deletedLoaded.value && !force) return
+    deletedLoading.value = true
+    try {
+      const res = await api.get<{ items: ApiDocument[] }>('/api/documents/trash')
+      deletedDocuments.value = (res.items ?? []).map(fromApi)
+      deletedLoaded.value = true
+    } catch (e) {
+      const msg = e instanceof ApiError ? e.message : '回收站加载失败'
+      console.error('[loadDeletedDocuments]', msg)
+      deletedDocuments.value = []
+    } finally {
+      deletedLoading.value = false
+    }
+  }
+
+  /**
+   * 恢复一篇回收站文档：
+   * - 乐观更新：从 deletedDocuments 移除，回到 documents 顶部
+   * - 失败回滚
+   */
+  async function restoreDocument(id: string): Promise<boolean> {
+    const idx = deletedDocuments.value.findIndex((d) => d.id === id)
+    if (idx < 0) return false
+    const snapshot = deletedDocuments.value[idx]
+    // 乐观：从回收站移除
+    deletedDocuments.value.splice(idx, 1)
+    try {
+      const doc = await api.post<ApiDocument>(`/api/documents/${id}/restore`)
+      const item = fromApi(doc)
+      // 插回"最近"顶部（按 updatedAt desc）
+      documents.value.unshift(item)
+      // 如果删的是当前打开的文档，currentId 不用切——它已经从 documents 列表移除了，
+      // 但内容应该已经没了，所以兜底切到第一篇或 null
+      if (currentId.value === id) {
+        currentId.value = documents.value[0]?.id ?? null
+      }
+      return true
+    } catch (e) {
+      console.error('[restoreDocument] failed', id, e)
+      // 回滚：把回收站文档插回原位
+      deletedDocuments.value.splice(idx, 0, snapshot)
+      throw e
+    }
+  }
+
+  /**
+   * 物理删除一篇回收站文档（用户点"彻底删除"按钮）：
+   * - 这才是真正从数据库抹掉
+   * - 二次确认由 UI 负责（ElMessageBox.confirm）
+   */
+  async function purgeDocument(id: string): Promise<boolean> {
+    const idx = deletedDocuments.value.findIndex((d) => d.id === id)
+    if (idx < 0) return false
+    const snapshot = deletedDocuments.value[idx]
+    deletedDocuments.value.splice(idx, 1)
+    try {
+      await api.delete(`/api/documents/${id}/permanent`)
+      return true
+    } catch (e) {
+      console.error('[purgeDocument] failed', id, e)
+      deletedDocuments.value.splice(idx, 0, snapshot)
+      throw e
+    }
+  }
+
   function applyTemplate(id: string) {
     const tpl = templates.value.find((t) => t.id === id)
     if (!tpl) return
@@ -469,18 +625,12 @@ export const useDocumentStore = defineStore('document', () => {
 
   /**
    * 判断文档内容是否"实质为空"：
-   * - 空 / 纯空白
-   * - 只有一级标题（自动生成的 `# 未命名文档-N`）
-   * - 只有默认占位符（`开始写点什么吧……`）
-   * 只要用户尚未写过一丁点有意义的内容，就视为空。
+   * 现在新文档创建时 content/title/excerpt 都已经是空字符串，所以这里只看
+   * "去掉所有空白后是不是空的"，避免老的占位符正则把真正的用户内容误判。
    */
   function isDocEmpty(content: string | undefined | null): boolean {
     if (!content) return true
-    const stripped = content
-      .replace(/^#\s+\S+.*$/m, '')           // 去掉一级标题
-      .replace(/开始写点什么吧[。. ~…]+/g, '') // 去掉默认占位符
-      .replace(/[\s\n\r\t]+/g, '')            // 去掉所有空白
-    return stripped === ''
+    return content.replace(/[\s\n\r\t]+/g, '') === ''
   }
 
   /**
@@ -893,6 +1043,9 @@ export const useDocumentStore = defineStore('document', () => {
     documents,
     documentsLoaded,
     documentsLoading,
+    deletedDocuments,
+    deletedLoaded,
+    deletedLoading,
     templates,
     templatesLoaded,
     templatesLoading,
@@ -912,8 +1065,12 @@ export const useDocumentStore = defineStore('document', () => {
     createNew,
     rename,
     updateContent,
+    deleteDocument,
     applyTemplate,
     loadDocuments,
+    loadDeletedDocuments,
+    restoreDocument,
+    purgeDocument,
     loadTemplates,
     flushPendingSaves,
     clearSelectedTemplate,

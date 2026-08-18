@@ -1,16 +1,32 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
-import { Plus, Document, ChatLineRound, Tickets } from '@element-plus/icons-vue'
+import { computed, onMounted, ref } from 'vue'
+import {
+  Plus,
+  Document,
+  ChatLineRound,
+  Tickets,
+  Delete,
+  RefreshLeft,
+  CircleClose
+} from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   useDocumentStore,
   PLATFORMS,
   type DocumentItem,
   type Platform
 } from '@/stores/document'
+import { ApiError } from '@/services/api'
 
 const store = useDocumentStore()
 
 const recentDocs = computed(() => store.documents)
+const trashDocs = computed(() => store.deletedDocuments)
+/** 回收站是否展开：默认折叠，避免列表很长时占太多视线 */
+const trashOpen = ref(false)
+
+/** 回收站保留期（与后端 purgeOldDocuments 默认值一致） */
+const TRASH_KEEP_DAYS = 30
 
 onMounted(() => {
   // 进入工作台时并行拉取：文档列表 + 模板列表
@@ -23,6 +39,21 @@ function formatDate(iso: string) {
   return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, '0')} ${String(
     d.getHours()
   ).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+/**
+ * 计算"还有 X 天彻底清理"。
+ * - 删了 ≤ 24 小时：显示"X 小时前删除"
+ * - 否则：显示"X 天后清理"
+ */
+function trashRemaining(iso: string): string {
+  const t = new Date(iso).getTime()
+  if (Number.isNaN(t)) return ''
+  const diffMs = Date.now() - t
+  const hours = Math.floor(diffMs / (60 * 60 * 1000))
+  if (hours < 24) return `${hours} 小时前删除`
+  const remainDays = TRASH_KEEP_DAYS - Math.floor(hours / 24)
+  return remainDays > 0 ? `${remainDays} 天后清理` : '即将清理'
 }
 
 function platformLabel(p: Platform) {
@@ -39,6 +70,89 @@ function handleOpen(doc: DocumentItem) {
 
 function handleTemplate(id: string) {
   store.applyTemplate(id)
+}
+
+/**
+ * 删除文档 → 软删除（移入回收站）：
+ * - 先弹 ElMessageBox 二次确认（避免误删）
+ * - 确认后调 store.deleteDocument，乐观更新 + 失败回滚由 store 负责
+ * - 阻止冒泡，避免点删除时触发打开文档
+ */
+async function handleDelete(doc: DocumentItem, e: Event) {
+  e.stopPropagation()
+  try {
+    await ElMessageBox.confirm(
+      `确定将「${doc.title || '未命名文档'}」移入回收站吗？\n回收站中的文档 30 天内可恢复。`,
+      '删除文档',
+      {
+        type: 'warning',
+        confirmButtonText: '移入回收站',
+        cancelButtonText: '取消',
+        confirmButtonClass: 'el-button--danger'
+      }
+    )
+  } catch {
+    // 用户点了取消
+    return
+  }
+  try {
+    await store.deleteDocument(doc.id)
+    ElMessage.success('已移入回收站，可在左侧"回收站"中恢复')
+  } catch (err) {
+    const msg = err instanceof ApiError ? err.message : '删除失败，请稍后再试'
+    ElMessage.error(msg)
+  }
+}
+
+/**
+ * 恢复一篇回收站文档（轻量提示，不再弹二次确认）。
+ */
+async function handleRestore(doc: DocumentItem, e: Event) {
+  e.stopPropagation()
+  try {
+    await store.restoreDocument(doc.id)
+    ElMessage.success('已恢复')
+  } catch (err) {
+    const msg = err instanceof ApiError ? err.message : '恢复失败，请稍后再试'
+    ElMessage.error(msg)
+  }
+}
+
+/**
+ * 彻底删除回收站文档（**物理删除，不可恢复**）：
+ * - 二次确认文案必须够强，避免误操作
+ */
+async function handlePurge(doc: DocumentItem, e: Event) {
+  e.stopPropagation()
+  try {
+    await ElMessageBox.confirm(
+      `确定彻底删除「${doc.title || '未命名文档'}」吗？\n该操作不可撤销，数据库里的内容也会一并清除。`,
+      '彻底删除',
+      {
+        type: 'warning',
+        confirmButtonText: '彻底删除',
+        cancelButtonText: '取消',
+        confirmButtonClass: 'el-button--danger'
+      }
+    )
+  } catch {
+    return
+  }
+  try {
+    await store.purgeDocument(doc.id)
+    ElMessage.success('已彻底删除')
+  } catch (err) {
+    const msg = err instanceof ApiError ? err.message : '彻底删除失败，请稍后再试'
+    ElMessage.error(msg)
+  }
+}
+
+function toggleTrash() {
+  trashOpen.value = !trashOpen.value
+  // 第一次展开时才拉回收站，避免无意义的请求
+  if (trashOpen.value && !store.deletedLoaded) {
+    store.loadDeletedDocuments()
+  }
 }
 </script>
 
@@ -77,6 +191,15 @@ function handleTemplate(id: string) {
             :class="{ 'doc-item--active': store.currentId === doc.id }"
             @click="handleOpen(doc)"
           >
+            <button
+              class="doc-item__delete"
+              type="button"
+              title="删除文档"
+              aria-label="删除文档"
+              @click="handleDelete(doc, $event)"
+            >
+              <el-icon><Delete /></el-icon>
+            </button>
             <div class="doc-item__title">{{ doc.title }}</div>
             <div class="doc-item__excerpt">{{ doc.excerpt || '（空）' }}</div>
             <div class="doc-item__meta">
@@ -135,6 +258,71 @@ function handleTemplate(id: string) {
         <el-icon><ChatLineRound /></el-icon>
         <span>文档已与账号绑定，仅自己可见</span>
       </footer>
+
+      <section class="group">
+        <header
+          class="group__title group__title--clickable"
+          @click="toggleTrash"
+        >
+          <el-icon><Delete /></el-icon>
+          <span>回收站</span>
+          <em class="group__count">{{ trashDocs.length }}</em>
+          <span class="group__toggle">
+            {{ trashOpen ? '收起' : '展开' }}
+          </span>
+        </header>
+
+        <div v-if="!trashOpen" />
+
+        <template v-else>
+          <div v-if="store.deletedLoading" class="template-empty">
+            <span class="loader" />
+            <span>正在加载回收站…</span>
+          </div>
+
+          <div
+            v-else-if="store.deletedLoaded && trashDocs.length === 0"
+            class="template-empty"
+          >
+            <span>回收站是空的，30 天内的删除都会出现在这里</span>
+          </div>
+
+          <ul v-else class="trash-list">
+            <li
+              v-for="doc in trashDocs"
+              :key="doc.id"
+              class="trash-item"
+            >
+              <div class="trash-item__title">{{ doc.title || '未命名文档' }}</div>
+              <div class="trash-item__meta">
+                <span class="trash-item__time">
+                  {{ doc.deletedAt ? trashRemaining(doc.deletedAt) : '' }}
+                </span>
+              </div>
+              <div class="trash-item__actions">
+                <button
+                  class="trash-item__btn trash-item__btn--restore"
+                  type="button"
+                  title="恢复文档"
+                  @click="handleRestore(doc, $event)"
+                >
+                  <el-icon><RefreshLeft /></el-icon>
+                  <span>恢复</span>
+                </button>
+                <button
+                  class="trash-item__btn trash-item__btn--purge"
+                  type="button"
+                  title="彻底删除"
+                  @click="handlePurge(doc, $event)"
+                >
+                  <el-icon><CircleClose /></el-icon>
+                  <span>彻底删除</span>
+                </button>
+              </div>
+            </li>
+          </ul>
+        </template>
+      </section>
     </div>
   </aside>
 </template>
@@ -206,6 +394,7 @@ function handleTemplate(id: string) {
   gap: 4px;
 }
 .doc-item {
+  position: relative;
   padding: var(--space-3);
   border-radius: var(--radius-md);
   cursor: pointer;
@@ -218,6 +407,36 @@ function handleTemplate(id: string) {
 .doc-item--active {
   background: var(--color-brand-light);
   border-color: rgba(79, 70, 229, 0.18);
+}
+/* 删除按钮：默认透明隐藏，hover 时浮现；激活态始终可见方便操作 */
+.doc-item__delete {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  opacity: 0;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+.doc-item:hover .doc-item__delete,
+.doc-item__delete:focus-visible {
+  opacity: 1;
+}
+.doc-item--active .doc-item__delete {
+  opacity: 0.7;
+}
+.doc-item__delete:hover {
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
 }
 .doc-item__title {
   font-size: var(--fs-base);
@@ -324,5 +543,78 @@ function handleTemplate(id: string) {
   padding: var(--space-3);
   background: var(--bg-muted);
   border-radius: var(--radius-md);
+}
+
+/* ---- 回收站 ---- */
+.group__title--clickable {
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.12s ease;
+}
+.group__title--clickable:hover {
+  color: var(--text-secondary);
+}
+.group__toggle {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: normal;
+}
+.trash-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.trash-item {
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--bg-muted);
+  border: 1px dashed var(--border-color, var(--border-soft));
+}
+.trash-item__title {
+  font-size: var(--fs-base);
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.trash-item__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: var(--space-2);
+}
+.trash-item__time {
+  font-variant-numeric: tabular-nums;
+}
+.trash-item__actions {
+  display: flex;
+  gap: 6px;
+}
+.trash-item__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-card, #fff);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+.trash-item__btn:hover {
+  border-color: var(--color-brand);
+  color: var(--color-brand);
+}
+.trash-item__btn--purge:hover {
+  border-color: #ef4444;
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.06);
 }
 </style>

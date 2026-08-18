@@ -311,8 +311,9 @@ async function handleApplySuggestion(msg: ChatMessage) {
 }
 
 /**
- * 用户点击 AI 给出的某个"路径 X"按钮：直接把 key 作为下一轮 prompt 发出去。
- * - AI 在历史里能看到"上一轮我给 A/B/C，用户选了 X"，所以传短 key 即可
+ * 用户在弹窗里挑了一个选项：把"选项 + 之前用户问的问题"合成新 prompt 发给 AI 续聊。
+ * - 必须拼上原问题：AI 只看到"路径 A"不知道你想干嘛，回答必然又吐出选项 → 死循环
+ * - 强制 forceMode='chat'：避免 AI 把"用户选了 X"误判成 edit，去推一份完整新文档
  * - 不走 prompt 输入框，绕过用户手动复制粘贴
  */
 async function handleChoice(choice: ChatChoice) {
@@ -321,13 +322,37 @@ async function handleChoice(choice: ChatChoice) {
     return
   }
   if (store.isGenerating) return
+
+  // 1) 从当前 chatThread 里找出"弹出这个选项"的 AI 消息之前的最近一条 user 消息
+  //    —— 用户原始问题是基于这个；不带上下文 AI 一定会再吐一份 A/B/C 回来
+  const docId = store.current.id
+  const thread = store.chatThread.get(docId) ?? []
+  const choiceMsgId = activeChoiceMsgId.value
+  let userPrompt = ''
+  if (choiceMsgId) {
+    const idx = thread.findIndex((m) => m.id === choiceMsgId)
+    if (idx >= 0) {
+      for (let i = idx - 1; i >= 0; i--) {
+        if (thread[i].role === 'user') {
+          userPrompt = thread[i].content
+          break
+        }
+      }
+    }
+  }
+  // 2) 合成明确指令：原问题 + 用户的选择
+  const composed = userPrompt
+    ? `针对问题"${userPrompt}"，我选「${choice.label}」：${choice.description}。请继续。`
+    : `我选「${choice.label}」：${choice.description}。请继续。`
+
   try {
     await store.generate({
-      prompt: `${choice.label}`,
+      prompt: composed,
       model: model.value,
       tone: tone.value,
       length: length.value,
-      language: language.value
+      language: language.value,
+      forceMode: 'chat' // 明确告诉前端"这是聊天不是改文档"
     })
   } catch (e) {
     const errMsg = e instanceof ApiError ? `${e.code} · ${e.message}` : '续聊失败，请稍后再试'
