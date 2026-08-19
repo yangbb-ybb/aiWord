@@ -74,107 +74,38 @@ function buildSystem(opts: {
   const length = lengthToText(opts.length ?? 50)
   const lang = LANG_DESC[opts.language ?? 'zh']
   return [
-    '你是 aiWord 的写作助手，同时也是用户的对话伙伴。',
-    '用户正编辑一份 Markdown 文档，但对话中也会包含闲聊、评价、问答等与文档无关的内容。',
-    `风格：${tone}`,
-    `长度：${length}`,
-    `语言：${lang}`,
+    '⚠️ 你的每一次回复都必须以这三行开头，紧挨着，不能有任何前缀/寒暄/emoji/围栏/解释：',
     '',
-    '## 你的回复必须严格遵守下面的格式（结构化协议）',
+    '[INTENT:edit|analyze|chat]',
+    '[ASK:none|choice|confirm]',
+    '[CONTENT]',
     '',
-    '每次回复头部必须依次出现三行声明（缺一不可，必须紧挨在回复最开头）：',
+    '`- intent` 三选一：edit=改文档，analyze=给建议不动文档，chat=闲聊。',
+    '`- ask` 三选一：要给用户选项（A/B/C/D）就 choice，要 yes/no 确认就 confirm，否则 none。',
     '',
-    '  行1: [INTENT:edit|analyze|chat]    —— 你对当前文档的态度（必填）',
-    '  行2: [ASK:none|choice|confirm]     —— 你是否在等用户做选择',
-    '  行3: [CONTENT]                      —— 正文从这一行开始',
+    '**默认 [INTENT:edit]**——用户说 "写/改/续/完善/补充/添加/插入/调整/润色/扩写/翻译/重写/修改/拼接/合并/排版/整理/起草/润色/扩写/往下/接着/继续" 等动词，直接 edit，不用问。',
+    'edit 模式正文 = 完整新文档（替换当前文档全部内容），让前端算 diff。',
     '',
-    '完整示例：',
+    '你是 aiWord 写作助手。',
+    `风格：${tone}。长度：${length}。语言：${lang}。`,
     '',
-    '    [INTENT:chat]',
-    '    [ASK:choice]',
-    '    [CONTENT]',
-    '    - **路径 A**：能挑自己想吃的菜，营养均衡首选',
-    '    - **路径 B**：单人小火锅，适合天冷',
-    '    - **路径 C**：麻辣烫，一口味更重',
+    '其他规则：',
+    '- [INTENT] / [ASK] 整份回复只能各出现一次',
+    '- 正文里禁止出现任何方括号协议标记',
+    '- 不要在正文里解释自己的模式（禁止 "我来/我会/我准备/不动文档/重新输出完整文档" 等元评论）',
+    '- edit 模式必须输出完整文档，不要只输出片段/摘要/开头',
+    '- 不要输出 ```json``` 围栏；不要在标记前加任何解释、寒暄、emoji',
     '',
-    '## 三种 [INTENT] 的含义',
-    '  A. [INTENT:edit]    — 用户希望**直接修改当前这份文档**（缩短/扩写/润色/加章节/修语法/改某段）',
-    '  B. [INTENT:analyze] — 用户希望**听取**评价/建议/分析，但**不动文档**',
-    '  C. [INTENT:chat]    — 闲聊/问候/知识问答/反问澄清/**与当前文档主题无关的话题**',
+    '⚠️ 再次强调：每条回复都**必须**以 [INTENT:xxx] 开头，缺前缀 = 错误回复。',
     '',
-    '## 三种 [ASK] 的含义（关键，决定前端是否弹窗）',
-    '  - [ASK:none]     — 给完答案就走，**前端不弹任何弹窗**（默认）',
-    '  - [ASK:choice]   — 你打算给用户 2~4 个可选项（A/B/C/D），正文里必须用 markdown 列表输出',
-    '                     **前端会弹出选项弹窗让用户一键选**——只有写了这行，前端才会弹',
-    '  - [ASK:confirm]  — 在等用户回答一个"是/否"类问题（不留选项），前端只 toast 提示',
+    '## 多选项输出格式（弹窗里要展示的）',
+    '要给用户 2~4 个可选项时，用这种格式：',
     '',
-    '## 何时该用哪种 [ASK]',
-    '  - 已经给出具体推荐 / 完整方案 → [ASK:none]（不要再列 A/B/C 凑数）',
-    '  - 你不知道用户想要哪条路，**确实需要用户在几条备选中挑** → [ASK:choice]',
-    '  - 你要问"要不要…/行不行…/可以吗…"等单选问题 → [ASK:confirm]',
-    '  - 闲聊 / 知识问答 / 解释类 → [ASK:none]',
+    '- **路径 A**：一句话描述',
+    '- **路径 B**：一句话描述',
+    '- **路径 C**：一句话描述',
     '',
-    '## 判断指引（**默认 [INTENT:edit]**，别让人白来一趟）',
-    '',
-    '**核心原则**：',
-    '- 用户说任何"写 / 改 / 完善 / 补充 / 继续 / 接着写" 类动词 → **就是来写作的，直接 edit**',
-    '- 写错了用户可以**拒绝**（rejectPendingDiff 不入聊天历史，零代价），所以**不要替用户决定"主题不相关就要新建"**',
-    '- **不要**做"主题相关 / 不相关"这种过度判断——用户说写什么就写什么',
-    '- 用户提到"当前文档 / 这篇文章"指向词 → 也算 edit（不要先去 chat 解释）',
-    '',
-    '**触发 [INTENT:edit]**（满足任一即 edit，覆盖绝大多数场景）：',
-    '',
-    'A. **写作 / 修改动词**（默认入口，覆盖 90% 用例）：',
-    '   - 用户 prompt 里包含任何"写 / 改 / 完善"类动词（任意一个即命中）：',
-    '     写 / 改 / 续 / 起草 / 完善 / 补充 / 添加 / 加入 / 整理 / 调整 / 润色 / 扩写 / 缩写 / 翻译 / 重写 / 重做 / 改写 / 修改 / 修正 / 续写 / 接着 / 继续 / 往下 / 生成 / 起草 / 起个草稿 / 起个标题',
-    '   - **直接 [INTENT:edit]**——不要先去 chat 解释你要写什么',
-    '   - 不管当前文档是《今晚吃什么》还是黄金分析报告，都直接 edit',
-    '   - 让用户看到 diff 后决定接受/拒绝；拒绝 = 这一轮白聊，零副作用',
-    '',
-    'B. **指向当前文档**（即使动词不明确也算 edit）：',
-    '   - 用户提到"这篇文章 / 我的文章 / 当前文档 / 这篇 / 这段 / 这个 / 上面 / 下面 / 开头 / 结尾 / 刚才写的" → 隐含对当前文档操作',
-    '   - → [INTENT:edit]',
-    '',
-    'C. **改写 / 替换 / 覆盖类**：',
-    '   - "重新写 / 覆盖 / 替换 / 重做 / 另起 / 写新的 / 再写一次" → [INTENT:edit]',
-    '',
-    '**触发 [INTENT:analyze]**：',
-    '- 用户明确要"评价 / 建议 / 分析"（"这段怎么样 / 看看哪里要改 / 给点建议 / 有什么问题 / 起个更好的标题"）',
-    '- → 不动文档，给建议',
-    '',
-    '**触发 [INTENT:chat]**（少数场景，**真的很少**）：',
-    '- **明确闲聊 / 问候 / 知识问答**（"你好 / 你是谁 / 讲个笑话 / 推荐餐厅 / 解释下 Python"）',
-    '- **反问澄清**（"这段开头有点长 / 感觉不太通顺 / 能优化吗 / 拿不准要哪种"）→ [ASK:choice] 让用户挑',
-    '- **不要**因为"主题不相关"就走 chat——用户说写就写',
-    '- **不要**因为"想先解释下要做什么"就走 chat——直接 edit，写错了用户拒绝',
-    '- **不要**给"思考 / 计划 / 元评论"配 chat——chat 里禁止"我会 / 我准备 / 我来 / 我会扩展 / 我会改"等元评论',
-    '',
-    '## 强约束（违反视为错误回复）',
-    '- **头部三行必须紧挨着出现在最开头**：`[INTENT:xxx]` → `[ASK:xxx]` → `[CONTENT]`，中间不允许插入任何其他文字。',
-    '- **[INTENT] 三选一只取一个，整份回复只能用一次**。',
-    '- **[ASK] 三选一只取一个**，没有反问/选项/确认时**必须写 [ASK:none]**，不能省略。',
-    '- **正文里禁止出现任何方括号协议标记**（`[INTENT:`、`[ASK:`、`[CONTENT]`、`[/INTENT]` 等）。哪怕在演示/举例/对比时也不能写出来。',
-    '- **不要在正文里解释自己的模式**（禁止"我来.../我会.../我准备.../本轮按 chat 处理"/"不动文档"/"我不会动文档"/"不会改文档"/"重新输出完整文档"/"我会扩展"/"我将补充"等任何元评论）。chat 和 edit 都要遵守。',
-    '- **edit 模式必须输出"完整新文档"**：[INTENT:edit] 时正文里**必须**是完整可用的 Markdown 文档（替换当前文档全部内容），让前端算 diff 给用户审阅。不要只输出"片段 / 开头 / 摘要"。',
-    '- **绝对不要自相矛盾**：同一次回复里既出现"我会改/我准备改/重新输出完整文档"又出现"我不会动/不动文档"。两种说法的存在会让前端无法判断，最终宁可当 chat 处理（不动文档）。',
-    '- 不要输出 ```json``` 围栏；不要在标记前加任何解释、寒暄、emoji；不要输出"好的，我来…"',
-    '',
-    '',
-    '## 多选项输出格式（让用户能一键点击）',
-    '当你要给用户提供 2~4 个可选项时，必须使用下面的格式（前端会解析成按钮）：',
-    '',
-    '    - **路径 A**：一句话描述这条路径做什么',
-    '    - **路径 B**：一句话描述这条路径做什么',
-    '    - **路径 C**：一句话描述这条路径做什么',
-    '',
-    '要求：',
-    '- key 必须用大写字母 A / B / C / D（最多 4 个）',
-    '- 每条用 markdown 无序列表 `- **<标签> X**：描述`，**标签二选一**，避免再换花样：',
-    '  - 中文标签：`路径 / 方案 / 选项 / 思路 / 方向 / 建议`（前端都认，挑顺眼的用）',
-    '  - 英文标签：`Path / Option / Idea / Approach`',
-    '- 分隔符必须用 **中文全角冒号 "："**（AI 在中文写作里几乎都用全角，前端也以全角为准）',
-    '- 描述控制在 20~60 字，不要再额外解释"请选一个"，按钮本身就是选项',
-    '- 单条建议时**不要用这个格式**（直接给建议即可，避免无意义的按钮）'
+    '要求：key 用 A/B/C/D 大写；中文标签用 `路径/方案/选项/思路/方向/建议`；分隔符用全角 "："；单条建议时不要用这个格式。'
   ].join('\n')
 }
 
@@ -221,19 +152,22 @@ export function parseStreamMeta(raw: string): StreamMeta | null {
  * - onMeta：一旦能从累积 chunk 里解析出 AI 头部声明就触发一次（向后兼容：解析不出就不触发）
  *
  * `model` 是前端下拉的 model id，会通过 resolveModel 映射成 provider 实际期望的名字。
+ * `prefill` 是 assistant prefill（最后一条 assistant 消息的内容），用来物理上强制模型
+ * 从某个特定开头续写——比如 '[INTENT:' 让模型必须续出协议头。
  */
 async function streamWith(
   messages: Message[],
   system: string,
   onChunk: (delta: string) => void,
   onMeta: ((meta: StreamMeta) => void) | undefined,
-  model?: string
+  model?: string,
+  prefill?: string
 ) {
   const provider = getProvider()
   // 累积 buffer：chunked 传输里协议头可能被切成多片，必须攒齐才能匹配
   let rawBuffer = ''
   let metaFired = false
-  const wrappedChunk = (delta: string) => {
+  const handleDelta = (delta: string) => {
     rawBuffer += delta
     if (!metaFired && onMeta) {
       const meta = parseStreamMeta(rawBuffer)
@@ -242,13 +176,31 @@ async function streamWith(
         onMeta(meta)
       }
     }
-    onChunk(delta)
   }
+  // 第一次进 wrappedChunk 时，如果用了 prefill，把 prefill 拼到 chunk 前面
+  // 让前端能看到完整协议头 '[INTENT:edit]\n[ASK:none]\n[CONTENT]\n'
+  // 而不是只看到模型续写的 'edit]\n[ASK:none]\n[CONTENT]\n'（缺 [INTENT: 前缀）
+  let prefillInjected = false
+  const wrappedChunk = (delta: string) => {
+    if (prefill && !prefillInjected) {
+      prefillInjected = true
+      const full = prefill + delta
+      handleDelta(full)
+      onChunk(full)
+    } else {
+      handleDelta(delta)
+      onChunk(delta)
+    }
+  }
+  // 把 prefill 作为最后一条 assistant 消息发给 SDK，让模型从那里续写
+  const finalMessages = prefill
+    ? [...messages, { role: 'assistant' as const, content: prefill }]
+    : messages
   const { text, tokens } = await provider.stream(
     {
       model: resolveModel(model ?? ''),
       system,
-      messages,
+      messages: finalMessages,
       temperature: 0.7,
       maxTokens: 4096
     },
@@ -258,7 +210,8 @@ async function streamWith(
   if (!metaFired && onMeta) {
     onMeta({ intent: 'chat', ask: 'none' })
   }
-  return { text, tokens }
+  // 最终 text 也要拼上 prefill（上面 wrappedChunk 只拼了流到前端的增量）
+  return { text: prefill ? prefill + text : text, tokens }
 }
 
 export async function runGenerate(
@@ -297,7 +250,17 @@ ${input.contextText}
   }
   messages.push({ role: 'user', content: userText })
 
-  return streamWith(messages, system, onChunk, onMeta, input.model)
+  // assistant prefill：物理上强制模型从 [INTENT: 开头续写协议头
+  // （之前只用 prompt 强调，模型长 prompt 下会"忘记"格式。prefill 是 Anthropic API
+  // 提供的可靠机制——模型必须从 prefill 后面开始写，不可能跳过协议头）
+  return streamWith(
+    messages,
+    system,
+    onChunk,
+    onMeta,
+    input.model,
+    '[INTENT:'
+  )
 }
 
 export async function runRewrite(
