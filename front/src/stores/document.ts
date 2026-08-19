@@ -781,6 +781,11 @@ export const useDocumentStore = defineStore('document', () => {
     // - chat/analyze 模式 → 右栏用它判断"AI 正在打字"（isChatStreaming）
     // - edit 模式 → 不维护（让中央 diff 视图独占，实时刷新）
     // 这样后端流式回来时，前端**立刻**根据已检测到的 intent 分流，不用等流结束
+    //
+    // mode 没识别前默认 'chat'（AI 99% 的非编辑指令都是聊天/分析）：
+    // - 让"一键生成"按下后立刻出现"AI 正在打字"的气泡，不需要等 meta 帧到达
+    // - 协议头/正文分片的剥离在 pushPreview 里做（用 stripProtocolInline）
+    // - meta 后续若带 intent='edit'，pushPreview 立刻把 streamingPreview 置 null 切走
     streamingPreview.value =
       detected === 'edit'
         ? null
@@ -789,7 +794,7 @@ export const useDocumentStore = defineStore('document', () => {
             preContent: baseContent,
             accumulated: '',
             rawBuffer: '',
-            mode: detected,
+            mode: detected ?? 'chat',
             prompt: opts.prompt ?? ''
           }
 
@@ -840,6 +845,8 @@ export const useDocumentStore = defineStore('document', () => {
 
     // 更新 streamingPreview（一次性塞新对象，触发响应式）
     // edit 模式不维护 streamingPreview——让中央 diff 视图独占
+    // 关键：accumulated 写入前用 stripProtocolInline 把 [INTENT:xxx]/[ASK:xxx]/[CONTENT] 抹掉，
+    // 这样右栏气泡打字过程就不会把协议头当成正文渲染出来。
     function pushPreview() {
       if (detected === 'edit') {
         streamingPreview.value = null
@@ -848,9 +855,9 @@ export const useDocumentStore = defineStore('document', () => {
       if (!streamingPreview.value) return
       streamingPreview.value = {
         ...streamingPreview.value,
-        accumulated: contentBuffer,
+        accumulated: stripProtocolInline(contentBuffer),
         rawBuffer,
-        mode: detected
+        mode: detected ?? 'chat'
       }
     }
 
@@ -938,6 +945,9 @@ export const useDocumentStore = defineStore('document', () => {
           // 每个流式 chunk 进来——立刻分流，**不等流结束**
           onDelta(delta) {
             rawBuffer += delta
+            // 无条件 append：保证右栏气泡逐字打字，无论 detected 是 null 还是已设
+            // 协议头会被 pushPreview 里的 stripProtocolInline 抹掉，不会泄漏给用户
+            contentBuffer += delta
             if (detected === null) {
               // 还在等头部协议。优先信后端 meta 事件；如果没收到，再退回到本地正则解析
               // - 后端 meta 事件走 onMeta 路径会立刻设 detected
@@ -946,22 +956,14 @@ export const useDocumentStore = defineStore('document', () => {
               if (parsed) {
                 detected = parsed.intent
                 detectedAsk = parsed.ask
-                contentBuffer = parsed.body
-                if (detected === 'edit') {
-                  schedulePushPendingDiff() // edit 模式：立刻初始化 diff
-                }
-                pushPreview()
-                return
               }
-              pushPreview()
-            } else {
-              // 已分流：本轮 chunk 全是正文
-              contentBuffer += delta
               if (detected === 'edit') {
-                schedulePushPendingDiff() // edit 模式：实时刷新 diff
+                schedulePushPendingDiff() // edit 模式：立刻初始化 diff
               }
-              pushPreview() // chat/analyze：实时更新 streamingPreview
+            } else if (detected === 'edit') {
+              schedulePushPendingDiff() // edit 模式：实时刷新 diff
             }
+            pushPreview() // chat/analyze 模式：实时更新 streamingPreview；edit 模式这里被首行 if 拦住置 null
           },
           // 后端结构化 meta 事件：拿到就立刻分流（**权威信号**）
           // 如果 stream 里没收到 meta（兼容老后端），onDelta 里的正则兜底
@@ -969,8 +971,10 @@ export const useDocumentStore = defineStore('document', () => {
             if (detected !== null) return // 已经切过了，不重复
             detected = meta.intent
             detectedAsk = meta.ask
-            // 把 rawBuffer 头部协议也剥掉，避免内容里残留协议字面引用
-            contentBuffer = stripProtocolInline(rawBuffer)
+            // onDelta 里已经无条件 contentBuffer += delta，所以 contentBuffer 此时可能已经包含了
+            // 第一个 chunk（含协议头）。直接 stripProtocolInline(contentBuffer) 把头剥掉，
+            // 后续 pushPreview 再走一遍也无所谓（同样的输入同样的输出）。
+            contentBuffer = stripProtocolInline(contentBuffer)
             if (detected === 'edit') {
               schedulePushPendingDiff() // edit 模式：立刻初始化 diff
             }
