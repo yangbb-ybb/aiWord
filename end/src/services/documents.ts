@@ -1,5 +1,6 @@
 import { and, desc, eq, isNotNull, isNull, lt } from 'drizzle-orm'
 import { db, schema } from '~/db'
+import { now } from '~/utils/time'
 
 const { documents } = schema
 
@@ -124,7 +125,7 @@ export async function deleteDocument(id: number, userId: number) {
   if (!existed) return false
   await db
     .update(documents)
-    .set({ deletedAt: new Date() })
+    .set({ deletedAt: now() })
     .where(
       and(
         eq(documents.id, id),
@@ -154,7 +155,7 @@ export async function restoreDocument(id: number, userId: number) {
   if (!row) return null
   await db
     .update(documents)
-    .set({ deletedAt: null, updatedAt: new Date() })
+    .set({ deletedAt: null, updatedAt: now() })
     .where(eq(documents.id, id))
   return getDocument(id, userId)
 }

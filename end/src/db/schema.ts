@@ -7,6 +7,7 @@ import {
   timestamp,
   varchar
 } from 'drizzle-orm/mysql-core'
+import { now } from '~/utils/time'
 
 /** 用户主表 —— 完整登录体系 */
 export const users = mysqlTable('users', {
@@ -29,7 +30,7 @@ export const users = mysqlTable('users', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at')
     .defaultNow()
-    .$onUpdate(() => new Date())
+    .$onUpdate(() => now())
     .notNull()
 })
 
@@ -76,7 +77,7 @@ export const wechatQrSessions = mysqlTable('wechat_qr_sessions', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at')
     .defaultNow()
-    .$onUpdate(() => new Date())
+    .$onUpdate(() => now())
     .notNull()
 })
 
@@ -95,12 +96,16 @@ export const documents = mysqlTable('documents', {
   /**
    * 软删除时间戳：null = 正常文档，非 null = 已删除（进入回收站）。
    * 物理删除仅在超过保留期（30 天）后由 purgeOldDocuments 清理。
+   *
+   * ⚠️ 时间戳统一存 UTC+8（北京时间）—— db/index.ts 里锁了 mysql2 driver timezone
+   *   + MySQL session time_zone，业务代码全部走 ~/utils/time 的 now()，不允许
+   *   直接 new Date()，否则进程 TZ 漂移会导致 created_at / updated_at 错位。
    */
   deletedAt: timestamp('deleted_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at')
     .defaultNow()
-    .$onUpdate(() => new Date())
+    .$onUpdate(() => now())
     .notNull()
 })
 

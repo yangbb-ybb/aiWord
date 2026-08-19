@@ -6,6 +6,7 @@ import { env } from '~/config/env'
 import { db } from '~/db'
 import { refreshTokens, smsCodes, users, type UserRow } from '~/db/schema'
 import { AppError } from './errors'
+import { now } from '~/utils/time'
 
 /**
  * 简化的 ms 解析：支持 '5m' / '2h' / '30d'，够用即可。
@@ -220,11 +221,11 @@ export async function consumeSmsCode(
 
 /** 清理过期验证码 / refresh token —— 定时任务或路由里偶尔调用 */
 export async function purgeExpired() {
-  const now = new Date()
-  await db.delete(smsCodes).where(lt(smsCodes.expiresAt, now))
+  const cutoff = now()
+  await db.delete(smsCodes).where(lt(smsCodes.expiresAt, cutoff))
   await db
     .delete(refreshTokens)
-    .where(lt(refreshTokens.expiresAt, now))
+    .where(lt(refreshTokens.expiresAt, cutoff))
 }
 
 // ---------- error ----------

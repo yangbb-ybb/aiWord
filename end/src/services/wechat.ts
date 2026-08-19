@@ -9,6 +9,7 @@ import {
 } from '~/db/schema'
 import { issueRefreshToken, signAccessToken, consumeSmsCode } from '~/services/auth'
 import { AppError } from './errors'
+import { now } from '~/utils/time'
 import {
   createUser,
   findUserByOpenid,
@@ -161,7 +162,7 @@ async function finalizeLogin(
       status: 'confirmed',
       userId: user.id,
       phone: user.phone ?? session.phone ?? null,
-      updatedAt: new Date()
+      updatedAt: now()
     })
     .where(eq(wechatQrSessions.id, session.id))
   return { user: toPublic(user), accessToken, refreshToken }

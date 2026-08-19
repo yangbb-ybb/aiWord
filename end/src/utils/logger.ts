@@ -10,6 +10,7 @@ import path from 'node:path'
 import pino, { multistream, type StreamEntry } from 'pino'
 import pinoroll from 'pino-roll'
 import { env } from '~/config/env'
+import { now } from '~/utils/time'
 
 function ensureDir(dir: string) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
@@ -86,7 +87,7 @@ export async function createLogger() {
 
 /** 极简 dev 终端格式化（避免再启 pino-pretty worker 进程）。 */
 function formatPretty(obj: Record<string, unknown>): string {
-  const ts = (obj.time as string) ?? new Date().toISOString()
+  const ts = (obj.time as string) ?? now().toISOString()
   const lvl = String(obj.level ?? 'info').toUpperCase().padEnd(5)
   const reqId = obj.reqId ? `[${String(obj.reqId).slice(0, 8)}] ` : ''
   const msg = obj.msg ?? ''

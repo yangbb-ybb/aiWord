@@ -12,6 +12,7 @@ import usersRoutes from '~/routes/users'
 import exportRoutes from '~/routes/export'
 import { AppError, isDbError } from './services/errors'
 import { createLogger } from './utils/logger'
+import { now } from './utils/time'
 import path from 'node:path'
 
 export async function buildApp() {
@@ -27,7 +28,7 @@ export async function buildApp() {
       nodeEnv: env.NODE_ENV,
       logLevel: env.LOG_LEVEL,
       logDir,
-      logFile: `${env.LOG_FILE}-${new Date().toISOString().slice(0, 10)}.log`
+      logFile: `${env.LOG_FILE}-${now().toISOString().slice(0, 10)}.log`
     },
     'logger initialized'
   )
