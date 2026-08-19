@@ -771,11 +771,11 @@ watch(
 .ce-body {
   flex: 1;
   overflow-y: auto;
-  padding: var(--space-6);
+  padding: var(--space-4) var(--space-2);
   background: var(--bg-app);
 }
 .ce-paper {
-  max-width: min(760px, 100%);
+  /* max-width: min(760px, 100%); */
   width: 100%;
   margin: 0 auto;
   background: var(--bg-paper);
@@ -789,7 +789,7 @@ watch(
 .ce-diff-editor {
   width: 100%;
   min-height: calc(100vh - 240px);
-  padding: var(--space-6) var(--space-8);
+  padding: var(--space-6) var(--space-6);
   font-family: 'Menlo', 'Consolas', 'Monaco', monospace;
   font-size: 14.5px;
   line-height: 1.8;
@@ -846,7 +846,7 @@ watch(
   border: none;
   outline: none;
   resize: none;
-  padding: var(--space-6) var(--space-8);
+  padding: var(--space-6) var(--space-6);
   font-family: 'Menlo', 'Consolas', 'Monaco', monospace;
   font-size: 14.5px;
   line-height: 1.8;

@@ -12,8 +12,18 @@ import { useAuthStore } from '@/stores/auth'
 const auth = useAuthStore()
 const router = useRouter()
 
-const leftCollapsed = ref(false)
+/**
+ * 左侧栏**默认折叠**——进工作台第一眼只看中央编辑器，左栏是辅助导航。
+ * 一旦用户主动展开过，会被记住（localStorage），下次进站保持展开。
+ */
+const SIDEBAR_KEY = 'aiword.leftCollapsed'
+// 默认折叠（true）；用户展开过一次后 localStorage 记成 '0'，下次保持展开
+const leftCollapsed = ref(localStorage.getItem(SIDEBAR_KEY) !== '0')
 const rightCollapsed = ref(false)
+function toggleLeft() {
+  leftCollapsed.value = !leftCollapsed.value
+  localStorage.setItem(SIDEBAR_KEY, leftCollapsed.value ? '1' : '0')
+}
 
 const avatarLetter = computed(() =>
   (auth.user?.nickname ?? 'A').slice(0, 1).toUpperCase()
@@ -39,7 +49,7 @@ async function onUserCommand(cmd: string) {
         <BrandLogo />
         <button
           class="topbar__toggle"
-          @click="leftCollapsed = !leftCollapsed"
+          @click="toggleLeft"
           :title="leftCollapsed ? '展开左侧' : '收起左侧'"
         >
           <el-icon>

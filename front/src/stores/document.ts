@@ -42,7 +42,7 @@ export interface GenerateOptions {
   /** 已存在的正文，传过去用于续写 */
   contextText?: string
   /** 对话历史（前端维护）：[{role, content, kind?}] */
-  history?: Array<{ role: 'user' | 'assistant'; content: string; kind?: 'edit' | 'analyze' | 'chat' }>
+  history?: Array<{ role: 'user' | 'assistant'; content: string; kind?: 'edit' | 'analyze' | 'chat'; ask?: AiAsk }>
   /**
    * 强制指定意图，跳过 AI 自主分流：
    * - 'edit'    → 直接进入 pendingDiff 流程
@@ -66,6 +66,15 @@ export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
   kind?: 'edit' | 'analyze' | 'chat'
+  /**
+   * AI 是否在等用户做选择（新版结构化协议的 [ASK:xxx] 字段）。
+   * - choice  → 弹选项弹窗
+   * - confirm → toast 提示
+   * - none    → 不弹窗（默认）
+   *
+   * 旧回复（没写 ASK）= 'none'。
+   */
+  ask?: AiAsk
   /** 毫秒时间戳，用于 UI 排序/格式化 */
   ts: number
 }
@@ -79,6 +88,67 @@ export interface ChatMessage {
 export type AiIntent = 'edit' | 'analyze' | 'chat'
 
 const INTENT_RE = /^\s*\[INTENT:(edit|analyze|chat)\]\s*/i
+/**
+ * 新版结构化协议：AI 头部必须依次输出三行
+ *   行1: [INTENT:edit|analyze|chat]
+ *   行2: [ASK:none|choice|confirm]
+ *   行3: [CONTENT]
+ * 然后才是正文。
+ *
+ * 这个正则"一次性"匹配前 3 行协议头。兼容老格式（只写第一行）—— 缺 ASK 视为 'none'。
+ */
+// 老正则要求 [CONTENT] 后必须有换行，但流式 chunk 切分时 [CONTENT] 后可能正好没有 \n，
+// 导致 rawBuffer 卡在 [..., [CONTENT]] 不匹配。放宽为 [CONTENT] 后任意字符即可。
+const PROTOCOL_HEADER_RE =
+  /^\s*\[INTENT:(edit|analyze|chat)\]\s*\n+\s*\[ASK:(none|choice|confirm)\]\s*\n+\s*\[CONTENT\]/i
+/**
+ * 兜底：只识别第一行 [INTENT]，没写 [ASK] 的视为 [ASK:none]（不弹窗）。
+ */
+const INTENT_ONLY_RE = /^\s*\[INTENT:(edit|analyze|chat)\]\s*/i
+/**
+ * 正文中残留的协议标记清理：万一 AI 把 [INTENT:xxx] / [ASK:xxx] / [CONTENT] 当字符串写进正文。
+ */
+const PROTOCOL_INLINE_RE =
+  /\s*\[(?:INTENT|ASK|CONTENT)(?::[^\]]*)?\]\s*/gi
+function stripProtocolInline(text: string): string {
+  return text.replace(PROTOCOL_INLINE_RE, '')
+}
+
+/**
+ * AI 的"是否在等用户做选择"信号，由结构化协议 [ASK:xxx] 决定。
+ * - choice → 前端弹选项弹窗（唯一权威信号）
+ * - confirm → 前端只 toast
+ * - none → 不弹窗
+ */
+export type AiAsk = 'none' | 'choice' | 'confirm'
+
+/**
+ * 从 AI 流式累积的原始文本里解析协议头。
+ * - 命中三行结构 → 返回 intent + ask + 去掉头部后的正文
+ * - 只命中第一行（老格式）→ ask 兜底为 'none'
+ * - 都没命中 → 返回 null（调用方走"老兜底逻辑"）
+ */
+export function parseProtocolHeader(
+  raw: string
+): { intent: AiIntent; ask: AiAsk; body: string } | null {
+  const m3 = raw.match(PROTOCOL_HEADER_RE)
+  if (m3) {
+    return {
+      intent: m3[1].toLowerCase() as AiIntent,
+      ask: m3[2].toLowerCase() as AiAsk,
+      body: raw.slice(m3[0].length)
+    }
+  }
+  const m1 = raw.match(INTENT_ONLY_RE)
+  if (m1) {
+    return {
+      intent: m1[1].toLowerCase() as AiIntent,
+      ask: 'none', // 老格式：没 ASK 就当 none，不弹窗
+      body: raw.slice(m1[0].length)
+    }
+  }
+  return null
+}
 
 /**
  * 一条"可点击选项"：AI 用 markdown 列表输出"**路径 X**：描述"，
@@ -457,6 +527,7 @@ export const useDocumentStore = defineStore('document', () => {
         role: 'user' | 'assistant'
         content: string
         kind?: 'edit' | 'analyze' | 'chat'
+        ask?: AiAsk
       }>
     >
   >(new Map())
@@ -696,6 +767,8 @@ export const useDocumentStore = defineStore('document', () => {
     let rawBuffer = ''
     let contentBuffer = ''
     let detected: AiIntent | null = opts.forceMode ?? null
+    // AI 自己声明的"是否在等用户做选择"，由结构化协议 [ASK:xxx] 决定
+    let detectedAsk: AiAsk = 'none'
 
     // 打开"实时预览"，先以未识别状态启动
     // 如果 forceMode 已指定，preview.mode 直接给定（避免流式中闪"未识别"）
@@ -708,65 +781,49 @@ export const useDocumentStore = defineStore('document', () => {
       prompt: opts.prompt ?? ''
     }
 
-    // 从一段文本里识别 [INTENT:edit|analyze|chat]；识别到就剥掉前缀
-    function matchIntent(text: string): { intent: AiIntent | null; rest: string } {
-      const m = text.match(INTENT_RE)
-      if (!m) return { intent: null, rest: text }
-      const intent = m[1].toLowerCase() as AiIntent
-      return { intent, rest: text.slice(m[0].length) }
+    /**
+     * 从累积的原始文本里解析协议头（新版三行结构 + 旧版单行兼容）。
+     * 命中 → 返回 intent + ask + 去掉头部后的正文
+     * 没命中 → 返回 null（让流式继续累积，不切换 UI）
+     */
+    function tryParseHeader(text: string) {
+      // 先试三行结构（新版）
+      const m3 = text.match(PROTOCOL_HEADER_RE)
+      if (m3) {
+        return {
+          intent: m3[1].toLowerCase() as AiIntent,
+          ask: m3[2].toLowerCase() as AiAsk,
+          body: text.slice(m3[0].length)
+        }
+      }
+      // 兜底：只识别第一行 [INTENT]（旧版 / AI 没学会新协议）
+      const m1 = text.match(INTENT_ONLY_RE)
+      if (m1) {
+        return {
+          intent: m1[1].toLowerCase() as AiIntent,
+          ask: 'none' as AiAsk, // 旧格式：没 ASK 就当 none，不弹窗
+          body: text.slice(m1[0].length)
+        }
+      }
+      return null
     }
 
     /**
-     * AI 漏标 [INTENT:xxx] 时的内容兜底：
-     * 在开头若干字符里如果出现"不动文档 / 按 chat 处理 / 闲聊回应 / 不修改当前文档"
-     * 等元评论短语 → 视为 [INTENT:chat]，避免把 AI 的解释+正文一起当作 edit 落到 pendingDiff
-     *
-     * 扫描窗口放宽到 1500 字，模式做宽容处理（覆盖 "不动文档" / "不会动文档" /
-     * "不会动这份文档" / "不会改当前文档" / "不修改文档" 等变体）。
-     * 同时检测 `----` 分隔符（系统提示里明令禁止的"前半说明、后半正文"写法）。
+     * 兜底：AI 完全没按协议输出时（罕见，理论上不应发生）。
+     * 新协议里 AI 必须输出 [INTENT]，所以这里直接当作 chat + none（最安全）。
      */
-    function inferIntentFromContent(text: string): AiIntent {
-      const head = text.slice(0, 1500)
-
-      // 1) 出现 `----` 分隔符就视为 chat：AI 在用禁止写法，整篇都得当 chat 处理
-      if (/[\s\n]-{3,}[\s\n]/.test(head)) return 'chat'
-
-      // 2) "不动文档 / 不修改文档 / 不会动这份文档" 等"拒绝改动"的元评论
-      const chatMarkers: RegExp[] = [
-        // "不动文档" / "不动当前文档" / "不动这份文档"
-        /不\s*动\s*[这篇份到个]?\s*\S{0,6}?文档/,
-        // "不会动文档" / "不会改文档" / "不会修改文档" / "不会动当前文档" / "不会动这份文档"
-        /不\s*会?\s*[动改修改]\s*[这篇份到个]?\s*\S{0,6}?文档/,
-        // "不修改文档" / "不修改当前文档"
-        /不\s*修改\s*[这篇份到个]?\s*\S{0,6}?文档/,
-        // "本次不动文档" / "本轮不动文档" / "这一轮不动文档"
-        /(?:本次?|本轮|这[一轮次]|这一轮)\s*(?:不|没)\s*(?:会|要)?\s*[动改修改]\s*[这篇份到个]?\s*\S{0,6}?文档/,
-        // "我不动文档" / "我不动当前文档"
-        /我\s*(?:不|没)\s*(?:会|要)?\s*[动改修改]\s*[这篇份到个]?\s*\S{0,6}?文档/,
-        // "按 chat 处理" / "按 chat 模式" / "按 chat 回应"
-        /按\s*["“]?\s*chat\s*["”]?\s*(?:模式|处理|回应)/i,
-        // "按闲聊回应" / "按闲聊处理"
-        /按\s*["“]?\s*闲聊/,
-        // "跟当前这份小说大纲没关系" / "跟当前文档主题无关"
-        /(?:跟|和|与)\s*当前\s*[这篇份个]?\S{0,30}?(?:没关系|无关|不[同关])/,
-        // "与当前文档主题无关" / "跟当前文档主题无关"
-        /(?:跟|和|与)\s*当前\s*文档\s*(?:主题\s*)?(?:无关|没关系|不[同关])/,
-        // "主题不相关" / "主题不一样"
-        /主题\s*不(?:同|相关|一样)/,
-        // "本次回答不会改动文档" —— 长前缀版本
-        /(?:本次?|这[一轮次])?\s*(?:回答|回复|输出)?\s*(?:不|没)\s*(?:会|要)?\s*[动改修改]\s*[这篇份到个]?\s*\S{0,6}?文档/
-      ]
-      for (const re of chatMarkers) {
-        if (re.test(head)) return 'chat'
+    function fallbackHeader() {
+      // AI 完全没按协议输出时（罕见），做最后一次兜底判断：
+      // - 如果清理后的 rawBuffer 能解析出"路径 A/B/C/D"等选项 → 给 choice，让用户能继续点选
+      // - 否则给 chat/none（最安全，不动文档）
+      // 这样无论协议头是否解析成功，只要 AI 给出了选项 UI 就能弹窗。
+      const cleaned = stripProtocolInline(rawBuffer)
+      const hasChoices = parseChoices(cleaned).length >= 1
+      return {
+        intent: 'chat' as AiIntent,
+        ask: hasChoices ? ('choice' as AiAsk) : ('none' as AiAsk),
+        body: cleaned
       }
-
-      // 3) AI 自相矛盾：同一段里既有"我会改/重新输出完整文档"也有"我不会动文档"
-      // → 视为 chat（AI 没拿定主意，宁可不动文档也别让用户误接受）
-      const willModify = /(?:我会|我将|我准备|扩展人物|重新输出完整文档|改写文档|润色文档|扩写文档|缩写文档|完整新文档|完整文档)/
-      const wontModify = /(?:不会动文档|不修改文档|不动文档|不会改文档)/
-      if (willModify.test(head) && wontModify.test(head)) return 'chat'
-
-      return 'edit'
     }
 
     // 更新 streamingPreview（一次性塞新对象，触发响应式）
@@ -784,7 +841,8 @@ export const useDocumentStore = defineStore('document', () => {
     function recordConversation(
       userPrompt: string,
       aiContent: string,
-      kind: AiIntent
+      kind: AiIntent,
+      ask: AiAsk = 'none'
     ) {
       const userMsg: ChatMessage = {
         id: `u-${Date.now()}`,
@@ -797,6 +855,7 @@ export const useDocumentStore = defineStore('document', () => {
         role: 'assistant',
         content: aiContent,
         kind,
+        ask,
         ts: Date.now() + 1
       }
       const next = new Map(chatThread.value)
@@ -806,7 +865,7 @@ export const useDocumentStore = defineStore('document', () => {
       const histNext = new Map(chatHistory.value)
       const histList = [...(histNext.get(doc.id) ?? [])]
       histList.push({ role: 'user', content: userPrompt })
-      histList.push({ role: 'assistant', content: aiContent, kind })
+      histList.push({ role: 'assistant', content: aiContent, kind, ask })
       histNext.set(doc.id, histList.slice(-20))
       chatHistory.value = histNext
     }
@@ -828,53 +887,67 @@ export const useDocumentStore = defineStore('document', () => {
           onDelta(delta) {
             rawBuffer += delta
             if (detected === null) {
-              // 还在等标签；命中后切到对应 UI
-              const { intent, rest } = matchIntent(rawBuffer)
-              if (intent) {
-                detected = intent
-                contentBuffer = rest
+              // 还在等头部协议。优先信后端 meta 事件；如果没收到，再退回到本地正则解析
+              // - 后端 meta 事件走 onMeta 路径会立刻设 detected
+              // - 这里再兜一层，确保即使后端没发出 meta，也能从 rawBuffer 切出来
+              const parsed = tryParseHeader(rawBuffer)
+              if (parsed) {
+                detected = parsed.intent
+                detectedAsk = parsed.ask
+                contentBuffer = parsed.body
                 pushPreview()
                 return
               }
-              // 没命中标签前不渲染正文（避免把 "[INTENT:edit]" 闪给用户看）
               pushPreview()
             } else {
               // 已分流：本轮 chunk 全是正文
               contentBuffer += delta
               pushPreview()
             }
+          },
+          // 后端结构化 meta 事件：拿到就立刻分流（**权威信号**）
+          // 如果 stream 里没收到 meta（兼容老后端），onDelta 里的正则兜底
+          onMeta(meta) {
+            if (detected !== null) return // 已经切过了，不重复
+            detected = meta.intent
+            detectedAsk = meta.ask
+            // 把 rawBuffer 头部协议也剥掉，避免内容里残留协议字面引用
+            contentBuffer = stripProtocolInline(rawBuffer)
+            pushPreview()
           }
         }
       )
+      console.log('当前ai请求得到的结果：');
+      console.log(fullText);
       if (fullText) {
         // 用最终全文重算（兼容后端在 done 事件里给到的最终字符串）
         rawBuffer = fullText
         if (detected === null) {
-          const { intent, rest } = matchIntent(rawBuffer)
-          if (intent) {
-            detected = intent
-            contentBuffer = rest
-          } else {
-            // 兜底：AI 没标 [INTENT:xxx]，按内容里是否出现"不动文档"等元评论来兜底分流
-            detected = inferIntentFromContent(rawBuffer)
-            contentBuffer = rawBuffer
-          }
+          const parsed = tryParseHeader(rawBuffer) ?? fallbackHeader()
+          detected = parsed.intent
+          detectedAsk = parsed.ask
+          contentBuffer = parsed.body
         }
         pushPreview()
       }
 
-      const finalMode: AiIntent = detected ?? 'edit'
+      const finalMode: AiIntent = detected ?? 'chat' // AI 没出协议 → 当 chat（最安全，不动文档）
 
+      // 兜底：剥掉正文里残留的 [INTENT/ASK/CONTENT] 字面引用（AI 偶尔会当示例写出来）
+      const cleanedContent = stripProtocolInline(contentBuffer)
+
+      console.log(finalMode, detectedAsk);
       // ============ analyze / chat：直接进 chatThread，不动文档 ============
       if (finalMode === 'analyze' || finalMode === 'chat') {
-        recordConversation(opts.prompt ?? '', contentBuffer, finalMode)
+        recordConversation(opts.prompt ?? '', cleanedContent, finalMode, detectedAsk)
         streamingPreview.value = null
-        return { content: contentBuffer, mode: finalMode }
+        return { content: cleanedContent, mode: finalMode }
       }
 
       // ============ edit：进入 pendingDiff 等用户接受/拒绝 ============
       // 计算行级 diff，给 UI 展示"AI 改了哪些行"
-      const postContent = contentBuffer || rawBuffer
+      // 用 cleanedContent 而不是原始 contentBuffer，把残留的协议标记字样也剥掉
+      const postContent = cleanedContent || stripProtocolInline(rawBuffer)
       const diffParts = diffLines(baseContent, postContent)
 
       streamingPreview.value = null
@@ -919,7 +992,7 @@ export const useDocumentStore = defineStore('document', () => {
     const histNext = new Map(chatHistory.value)
     const histList = [...(histNext.get(pd.docId) ?? [])]
     histList.push({ role: 'user', content: pd.prompt })
-    histList.push({ role: 'assistant', content: pd.postContent, kind: 'edit' })
+    histList.push({ role: 'assistant', content: pd.postContent, kind: 'edit', ask: 'none' })
     histNext.set(pd.docId, histList.slice(-20))
     chatHistory.value = histNext
 
@@ -937,6 +1010,7 @@ export const useDocumentStore = defineStore('document', () => {
       role: 'assistant',
       content: pd.postContent,
       kind: 'edit',
+      ask: 'none',
       ts: Date.now()
     })
     threadNext.set(pd.docId, threadList)

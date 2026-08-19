@@ -4,6 +4,9 @@
  * - 收到 401 只清 token + 触发 onUnauthorized 回调，跳转交给 router（避免 location.href 硬刷导致请求堆积/重复触发 fetchMe）
  * - refresh 接口走第二个实例，避免全局拦截器在 refresh 失败时递归跳登录
  * - 后端基础 URL 通过 VITE_API_BASE_URL 配置，默认 http://localhost:8787
+ *
+ * ⚠️ 业务代码统一从这里导出的 `api` / `ApiError` 发起请求。
+ * ⚠️ 不要直接写 axios(...) 或 fetch(...)。唯一例外是 ./stream.ts —— SSE 流式必须用 fetch + ReadableStream，axios 不支持。
  */
 
 import axios, { AxiosError, type AxiosInstance, type AxiosResponse } from 'axios'

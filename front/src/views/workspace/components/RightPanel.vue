@@ -35,6 +35,8 @@ const tone = ref('formal')
 const length = ref(50)
 const language = ref('zh')
 const prompt = ref('')
+/** Prompt 为空时按钮直接置灰，从源头避免空请求；与 handleGenerate 里的兜底判断保持一致 */
+const canGenerate = computed(() => !store.isGenerating && prompt.value.trim().length > 0)
 
 const modelOptions = ref<{ label: string; value: string }[]>([])
 const providerName = ref('minimax')
@@ -144,7 +146,9 @@ watch(
     const thread = chatMessages.value
     for (let i = thread.length - 1; i >= 0; i--) {
       const m = thread[i]
-      if (m.role === 'assistant' && m.kind === 'chat' && choicesOf(m).length >= 1) {
+      // 必须同时满足：能解析出选项 + 真的是在反问/把选择权交回给用户
+      // 仅"能解析出选项"不够 —— AI 经常在完整答案后列举对比，不该弹窗干扰
+      if (m.role === 'assistant' && shouldShowChoiceDialog(m) && choicesOf(m).length >= 1) {
         // 已经为这条消息弹过就不再重复弹（id 不一致才更新）
         if (activeChoiceMsgId.value !== m.id) activeChoiceMsgId.value = m.id
         return
@@ -231,8 +235,10 @@ async function handleGenerate() {
     ElMessage.warning('请先选择或创建文档')
     return
   }
-  if (!prompt.value.trim() && !store.current.content?.trim()) {
-    ElMessage.warning('请填写 Prompt 或先有正文')
+  // prompt 必须有内容才能发起请求：避免"空 query"打到后端浪费 token，
+  // 也避免已有正文 + 空 prompt 的歧义请求让 AI 自由发挥产生不可控输出。
+  if (!prompt.value.trim()) {
+    ElMessage.warning('请填写 Prompt')
     return
   }
   const userPrompt = prompt.value
@@ -369,6 +375,19 @@ function choicesOf(msg: ChatMessage): ChatChoice[] {
   if (msg.kind === 'edit') return []
   return parseChoices(msg.content)
 }
+
+/**
+ * 是否弹"AI 选项"弹窗 —— 唯一权威信号：AI 自己声明的 [ASK:choice]。
+ *
+ * 新版结构化协议里：
+ * - chat/analyze 消息如果 ask === 'choice' 才弹
+ * - 其他情况一律不弹（不再靠反问词启发式判定，协议说没有就没有）
+ */
+function shouldShowChoiceDialog(msg: ChatMessage): boolean {
+  if (msg.role !== 'assistant') return false
+  if (msg.kind === 'edit') return false
+  return msg.ask === 'choice' && choicesOf(msg).length >= 1
+}
 </script>
 
 <template>
@@ -457,7 +476,7 @@ function choicesOf(msg: ChatMessage): ChatChoice[] {
 
         <button
           class="generate-btn"
-          :disabled="store.isGenerating"
+          :disabled="!canGenerate"
           @click="handleGenerate"
         >
           <el-icon v-if="!store.isGenerating"><MagicStick /></el-icon>

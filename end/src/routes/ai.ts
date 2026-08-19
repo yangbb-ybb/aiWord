@@ -75,16 +75,20 @@ function ensureAiAvailable(req: any, reply: any): boolean {
 
 /**
  * 通用：流式调用 AI 服务并把每个 chunk 写成 SSE。
- * event: chunk | done | error
+ * event: meta | chunk | done | error
  *
- * runner 是 (onChunk) => Promise<{text, tokens}>；这里再套一层日志和计时。
+ * meta 事件承载 AI 头部声明 [INTENT]/[ASK]/[CONTENT] 的结构化字段（一旦拿到就立刻发），
+ * 这样前端不需要靠正则从文本里挖协议位，能直接拿到干净的 { intent, ask }。
+ *
+ * runner 是 (onChunk, onMeta) => Promise<{text, tokens}>；这里再套一层日志和计时。
  */
 async function streamAi(
   req: any,
   reply: any,
   event: string,
   runner: (
-    onChunk: (delta: string) => void
+    onChunk: (delta: string) => void,
+    onMeta: (meta: { intent: 'edit' | 'analyze' | 'chat'; ask: 'none' | 'choice' | 'confirm' }) => void
   ) => Promise<{ text: string; tokens?: number }>
 ) {
   // reply.raw.write() 会绕过 @fastify/cors 的 reply.send 自动注入，
@@ -107,11 +111,20 @@ async function streamAi(
 
   const start = Date.now()
   let chunkCount = 0
+  let metaSent = false
   try {
-    const result = await runner((delta) => {
-      chunkCount++
-      send('chunk', { text: delta })
-    })
+    const result = await runner(
+      (delta) => {
+        chunkCount++
+        send('chunk', { text: delta })
+      },
+      // meta 一旦确定立刻 push 给前端，前端不再依赖正则从 text 解析协议
+      (meta) => {
+        if (metaSent) return
+        metaSent = true
+        send('meta', meta)
+      }
+    )
     send('done', { text: result.text, tokens: result.tokens })
     req.log.info(
       {
@@ -155,8 +168,8 @@ export default async function aiRoutes(app: FastifyInstance) {
       },
       'ai generate start'
     )
-    await streamAi(req, reply, 'generate', (onChunk) =>
-      runGenerate(body, onChunk)
+    await streamAi(req, reply, 'generate', (onChunk, onMeta) =>
+      runGenerate(body, onChunk, onMeta)
     )
   })
 
@@ -173,7 +186,9 @@ export default async function aiRoutes(app: FastifyInstance) {
       },
       'ai rewrite start'
     )
-    await streamAi(req, reply, 'rewrite', (onChunk) => runRewrite(body, onChunk))
+    await streamAi(req, reply, 'rewrite', (onChunk, onMeta) =>
+      runRewrite(body, onChunk, onMeta)
+    )
   })
 
   app.post('/summarize', async (req, reply) => {
@@ -188,8 +203,8 @@ export default async function aiRoutes(app: FastifyInstance) {
       },
       'ai summarize start'
     )
-    await streamAi(req, reply, 'summarize', (onChunk) =>
-      runSummarize(body, onChunk)
+    await streamAi(req, reply, 'summarize', (onChunk, onMeta) =>
+      runSummarize(body, onChunk, onMeta)
     )
   })
 
@@ -205,8 +220,8 @@ export default async function aiRoutes(app: FastifyInstance) {
       },
       'ai translate start'
     )
-    await streamAi(req, reply, 'translate', (onChunk) =>
-      runTranslate(body, onChunk)
+    await streamAi(req, reply, 'translate', (onChunk, onMeta) =>
+      runTranslate(body, onChunk, onMeta)
     )
   })
 

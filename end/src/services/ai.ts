@@ -80,45 +80,97 @@ function buildSystem(opts: {
     `长度：${length}`,
     `语言：${lang}`,
     '',
-    '## 你的回复必须严格遵守下面的格式',
-    '第一步：从用户最新一句判断意图，**三种之一**：',
+    '## 你的回复必须严格遵守下面的格式（结构化协议）',
+    '',
+    '每次回复头部必须依次出现三行声明（缺一不可，必须紧挨在回复最开头）：',
+    '',
+    '  行1: [INTENT:edit|analyze|chat]    —— 你对当前文档的态度（必填）',
+    '  行2: [ASK:none|choice|confirm]     —— 你是否在等用户做选择',
+    '  行3: [CONTENT]                      —— 正文从这一行开始',
+    '',
+    '完整示例：',
+    '',
+    '    [INTENT:chat]',
+    '    [ASK:choice]',
+    '    [CONTENT]',
+    '    - **路径 A**：能挑自己想吃的菜，营养均衡首选',
+    '    - **路径 B**：单人小火锅，适合天冷',
+    '    - **路径 C**：麻辣烫，一口味更重',
+    '',
+    '## 三种 [INTENT] 的含义',
     '  A. [INTENT:edit]    — 用户希望**直接修改当前这份文档**（缩短/扩写/润色/加章节/修语法/改某段）',
     '  B. [INTENT:analyze] — 用户希望**听取**评价/建议/分析，但**不动文档**',
     '  C. [INTENT:chat]    — 闲聊/问候/知识问答/反问澄清/**与当前文档主题无关的话题**',
     '',
-    '第二步：根据意图输出**仅且只能**以下三种开头之一：',
-    '  - [INTENT:edit]    → 紧跟其后输出**完整的新文档 Markdown**',
-    '  - [INTENT:analyze] → 紧跟其后输出评价/建议，可用 Markdown；**禁止输出完整新文档**',
-    '  - [INTENT:chat]    → 紧跟其后输出答复，可用 Markdown；**禁止输出完整新文档**',
+    '## 三种 [ASK] 的含义（关键，决定前端是否弹窗）',
+    '  - [ASK:none]     — 给完答案就走，**前端不弹任何弹窗**（默认）',
+    '  - [ASK:choice]   — 你打算给用户 2~4 个可选项（A/B/C/D），正文里必须用 markdown 列表输出',
+    '                     **前端会弹出选项弹窗让用户一键选**——只有写了这行，前端才会弹',
+    '  - [ASK:confirm]  — 在等用户回答一个"是/否"类问题（不留选项），前端只 toast 提示',
     '',
-    '## 判断指引（拿不准时，优先 [INTENT:chat]，绝不乱动文档）',
+    '## 何时该用哪种 [ASK]',
+    '  - 已经给出具体推荐 / 完整方案 → [ASK:none]（不要再列 A/B/C 凑数）',
+    '  - 你不知道用户想要哪条路，**确实需要用户在几条备选中挑** → [ASK:choice]',
+    '  - 你要问"要不要…/行不行…/可以吗…"等单选问题 → [ASK:confirm]',
+    '  - 闲聊 / 知识问答 / 解释类 → [ASK:none]',
     '',
-    '**触发 [INTENT:edit] 的充要条件**：',
-    '- 用户明确指向**当前这份文档**（"这篇文章/我的文章/这段/上面/下面/开头/结尾"）',
-    '- AND 用户给的是**针对当前文档的动作**（缩短/扩写/润色/加一句/删掉这段/把 X 改成 Y/翻译当前文档）',
-    '- 缺一不可。主题与当前文档无关 → 走 [INTENT:chat]',
+    '## 判断指引（拿不准时，**优先 [INTENT:edit]**，别让人白来一趟）',
+    '',
+    '**触发 [INTENT:edit] 的充要条件**（满足任一即可）：',
+    '',
+    'A. **空文档 + 写作意图**（默认入口，最常见）：',
+    '   - 当前文档**实质为空**（contextText 几乎没东西 / 只有标题 / 只有几行占位）',
+    '   - AND 用户表达写作意图（"写一篇 / 起草 / 帮我写 / 写个 / 生成一份 / 介绍下 / 总结下…"）',
+    '   - → 直接 [INTENT:edit]，在当前文档里写',
+    '   - **不要建议"另起一份"**——这就是用户打开工作台来写作的默认路径',
+    '',
+    'B. **指向当前文档 + 文档操作**：',
+    '   - 用户明确指向当前文档（"这篇文章 / 我的文章 / 这段 / 上面 / 下面 / 开头 / 结尾"）',
+    '   - AND 用户给的是针对当前文档的动作（缩短 / 扩写 / 润色 / 加一句 / 删这段 / 把 X 改成 Y / 翻译当前文档）',
+    '',
+    'C. **主题相关**：',
+    '   - 当前文档有内容 + 用户请求明显是同一文章的后续（同一主题 / 同一文体）',
+    '',
+    'D. **用户明确覆盖 / 替换**：',
+    '   - "重新写 / 覆盖 / 替换 / 就写到当前 / 暂时放这" → [INTENT:edit]（用户明确指令优先）',
     '',
     '**触发 [INTENT:analyze]**：',
-    '- "这段怎么样/看看哪里要改/给点建议/有什么问题/起个更好的标题"（对当前文档的元操作）',
+    '- "这段怎么样 / 看看哪里要改 / 给点建议 / 有什么问题 / 起个更好的标题"（对当前文档的元操作）',
     '',
-    '**触发 [INTENT:chat]**（覆盖以下所有情况）：',
-    '- 闲聊/问候/知识问答（"你好/你是谁/讲个笑话/推荐/解释下…"）',
-    '- **主题与当前文档无关**（"给我写个小说大纲/帮我写首古诗/讲个 Python 例子"——当前文档是别的）',
-    '- **模糊请求**（"开头有点长"/"感觉不太通顺"/"能优化吗"）→ 反问一句："你想让我直接改，还是先给点建议？"',
+    '**触发 [INTENT:chat]**（剩下的情况）：',
+    '- 闲聊 / 问候 / 知识问答（"你好 / 你是谁 / 讲个笑话 / 推荐餐厅…"）',
+    '- **当前文档有实质内容 + 用户请求主题完全无关 + 用户没说"就写到这"** → 建议新建文档',
+    '- **模糊请求**（"开头有点长 / 感觉不太通顺 / 能优化吗"）→ 反问一句："你想让我直接改，还是先给点建议？"',
     '',
-    '## 关键：主题不相关时怎么办',
-    '当用户请求**与当前文档主题无关**时（如当前是《体能锻炼计划》，用户说"写个小说大纲"）：',
-    '- 必须走 [INTENT:chat]',
-    '- 在回复里**明确告诉用户**：这份请求跟当前文档主题不一样，建议新建一份文档来放',
-    '- 可以**简要回答**用户的问题（如贴一段小说大纲示例），但不要用"----"分隔后假装是新文档',
-    '- 让用户主动选择：新建文档 / 暂时把内容贴到这里',
+    '## 关键：什么时候"另起一篇"，什么时候"写到当前"',
+    '',
+    '后端会告诉你**当前文档标题**和**当前文档正文**。请按下面判断：',
+    '',
+    '1. **当前文档实质为空**（没标题 / 只有占位符 / 几行没成形的内容）：',
+    '   - 用户说"写一篇… / 帮我写…" → [INTENT:edit]，**直接在当前文档里写**',
+    '   - 这是用户打开工作台来写作的默认入口，**不要**建议"新建文档"',
+    '',
+    '2. **当前文档有完整内容** + 用户请求主题与文档主题**明显不同**（不同领域、不同体裁）+ 用户没说"就写到这"：',
+    '   - 走 **[INTENT:chat]** + **[ASK:choice]**',
+    '   - **必须给出两个选项**（用 markdown bullet + bold 格式），让用户一键选择：',
+    '     - **路径 A**：新建一份独立文档来放这段内容（前端会自动新建并填入）',
+    '     - **路径 B**：暂时写到当前文档（会覆盖原内容，前端会二次确认）',
+    '   - **正文里直接给出完整新内容**（markdown 格式，无需用 ---- 假装分隔符）',
+    '   - 这样不管用户选 A 还是 B，前端都有内容可用——不要只"建议"而不给选项',
+    '',
+    '3. **如果用户在 prompt 里明确说"就写到当前 / 暂时放这 / 覆盖 / 重新写"**：',
+    '   - 即使主题不同，也 [INTENT:edit]（用户明确指令优先）',
     '',
     '## 强约束（违反视为错误回复）',
-    '- **第一行必须是且只能是三种标签之一**，整份回复只能用一次；没标签 = 视为 [INTENT:edit]（前端会真改文档！）',
-    '- **不要在回复里解释自己的模式**（禁止"本轮回复按 chat 处理"/"不动文档"/"我不会动文档"/"不会改文档"/"重新输出完整文档"/"我会扩展"等任何元评论）',
-    '- **不要用分隔符（----）假装"前半是说明、后半是正文"**——一旦你声明了 [INTENT:chat]，正文里就不该出现完整可被当作"新文档"的内容',
+    '- **头部三行必须紧挨着出现在最开头**：`[INTENT:xxx]` → `[ASK:xxx]` → `[CONTENT]`，中间不允许插入任何其他文字。',
+    '- **[INTENT] 三选一只取一个，整份回复只能用一次**。',
+    '- **[ASK] 三选一只取一个**，没有反问/选项/确认时**必须写 [ASK:none]**，不能省略。',
+    '- **正文里禁止出现任何方括号协议标记**（`[INTENT:`、`[ASK:`、`[CONTENT]`、`[/INTENT]` 等）。哪怕在演示/举例/对比时也不能写出来。',
+    '- **不要在正文里解释自己的模式**（禁止"本轮回复按 chat 处理"/"不动文档"/"我不会动文档"/"不会改文档"/"重新输出完整文档"/"我会扩展"等任何元评论）。',
+    '- **主题不相关 + 给选项场景的例外**：[INTENT:chat] + [ASK:choice] 用于"新建文档 / 覆盖当前"分流时，正文里**必须**给出完整可用的新内容（前端拿到直接填入）。其他 chat 场景（闲聊 / 反问 / 知识问答）才禁止"假装是新文档"。',
     '- **绝对不要自相矛盾**：同一次回复里既出现"我会改/我准备改/重新输出完整文档"又出现"我不会动/不动文档"。两种说法的存在会让前端无法判断，最终宁可当 chat 处理（不动文档）。',
     '- 不要输出 ```json``` 围栏；不要在标记前加任何解释、寒暄、emoji；不要输出"好的，我来…"',
+    '',
     '',
     '## 多选项输出格式（让用户能一键点击）',
     '当你要给用户提供 2~4 个可选项时，必须使用下面的格式（前端会解析成按钮）：',
@@ -139,16 +191,71 @@ function buildSystem(opts: {
 }
 
 /**
- * 通用业务方法：拿 provider，调 stream()，把增量喂给 onChunk 回调。
+ * AI 头部声明解析出来的结构化意图（流式响应里第一个 emit 的"meta"事件）。
+ * 服务端解析后通过 SSE `event: meta` 一次性推给前端；前端不再依赖正则从 text 里挖协议位。
+ */
+export type StreamMeta = {
+  intent: 'edit' | 'analyze' | 'chat'
+  ask: 'none' | 'choice' | 'confirm'
+}
+
+/** 三行结构：[INTENT:xxx]\n[ASK:xxx]\n[CONTENT]（后接正文） */
+const PROTOCOL_HEADER_RE =
+  /^\s*\[INTENT:(edit|analyze|chat)\]\s*\n+\s*\[ASK:(none|choice|confirm)\]\s*\n+\s*\[CONTENT\]/i
+/** 老格式兜底：只识别第一行 [INTENT] */
+const INTENT_ONLY_RE = /^\s*\[INTENT:(edit|analyze|chat)\]\s*/i
+
+/**
+ * 尝试从累积文本里解析头部声明。命中 → { intent, ask, body }；没命中 → null。
+ */
+export function parseStreamMeta(raw: string): StreamMeta | null {
+  const m3 = raw.match(PROTOCOL_HEADER_RE)
+  if (m3) {
+    return {
+      intent: m3[1].toLowerCase() as StreamMeta['intent'],
+      ask: m3[2].toLowerCase() as StreamMeta['ask']
+    }
+  }
+  const m1 = raw.match(INTENT_ONLY_RE)
+  if (m1) {
+    return {
+      intent: m1[1].toLowerCase() as StreamMeta['intent'],
+      ask: 'none'
+    }
+  }
+  return null
+}
+
+/**
+ * 通用业务方法：拿 provider，调 stream()。
+ *
+ * - onChunk：每个增量原文（**含协议头**，前端仍按原样展示正文即可）
+ * - onMeta：一旦能从累积 chunk 里解析出 AI 头部声明就触发一次（向后兼容：解析不出就不触发）
+ *
  * `model` 是前端下拉的 model id，会通过 resolveModel 映射成 provider 实际期望的名字。
  */
 async function streamWith(
   messages: Message[],
   system: string,
   onChunk: (delta: string) => void,
+  onMeta: ((meta: StreamMeta) => void) | undefined,
   model?: string
 ) {
   const provider = getProvider()
+  // 累积 buffer：chunked 传输里协议头可能被切成多片，必须攒齐才能匹配
+  let rawBuffer = ''
+  let metaFired = false
+  const wrappedChunk = (delta: string) => {
+    rawBuffer += delta
+    if (!metaFired && onMeta) {
+      const meta = parseStreamMeta(rawBuffer)
+      if (meta) {
+        metaFired = true
+        onMeta(meta)
+      }
+    }
+    onChunk(delta)
+  }
   const { text, tokens } = await provider.stream(
     {
       model: resolveModel(model ?? ''),
@@ -157,14 +264,19 @@ async function streamWith(
       temperature: 0.7,
       maxTokens: 4096
     },
-    onChunk
+    wrappedChunk
   )
+  // 流结束还没解析出头（理论上不应发生）→ 走兜底：当 chat + none，最安全
+  if (!metaFired && onMeta) {
+    onMeta({ intent: 'chat', ask: 'none' })
+  }
   return { text, tokens }
 }
 
 export async function runGenerate(
   input: GenerateInput,
-  onChunk: (delta: string) => void
+  onChunk: (delta: string) => void,
+  onMeta?: (meta: StreamMeta) => void
 ) {
   const system = buildSystem({
     tone: input.tone,
@@ -197,12 +309,13 @@ ${input.contextText}
   }
   messages.push({ role: 'user', content: userText })
 
-  return streamWith(messages, system, onChunk, input.model)
+  return streamWith(messages, system, onChunk, onMeta, input.model)
 }
 
 export async function runRewrite(
   input: RewriteInput,
-  onChunk: (delta: string) => void
+  onChunk: (delta: string) => void,
+  onMeta?: (meta: StreamMeta) => void
 ) {
   const system = buildSystem({ tone: input.tone ?? 'formal' })
   const user = [
@@ -214,12 +327,13 @@ export async function runRewrite(
     '原文：',
     input.text
   ].join('\n')
-  return streamWith([{ role: 'user', content: user }], system, onChunk, input.model)
+  return streamWith([{ role: 'user', content: user }], system, onChunk, onMeta, input.model)
 }
 
 export async function runSummarize(
   input: SummarizeInput,
-  onChunk: (delta: string) => void
+  onChunk: (delta: string) => void,
+  onMeta?: (meta: StreamMeta) => void
 ) {
   const system = [
     '你是 aiWord 的摘要助手。',
@@ -230,13 +344,15 @@ export async function runSummarize(
     [{ role: 'user', content: `请摘要以下内容：\n\n${input.text}` }],
     system,
     onChunk,
+    onMeta,
     input.model
   )
 }
 
 export async function runTranslate(
   input: TranslateInput,
-  onChunk: (delta: string) => void
+  onChunk: (delta: string) => void,
+  onMeta?: (meta: StreamMeta) => void
 ) {
   const langMap = { zh: '中文', en: 'English', mixed: '中英混合' } as const
   const system = [
@@ -248,6 +364,7 @@ export async function runTranslate(
     [{ role: 'user', content: input.text }],
     system,
     onChunk,
+    onMeta,
     input.model
   )
 }

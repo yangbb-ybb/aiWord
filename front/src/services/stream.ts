@@ -4,7 +4,10 @@
  *   event: chunk | done | error
  *   data: { text: '...' } | { text, tokens } | { message }
  *
- * 这里不引入 EventSource（它只支持 GET），改成 fetch + ReadableStream 手动解析。
+ * ⚠️ 这里必须用 fetch —— SSE 的 ReadableStream 流式读取只有 fetch 支持。
+ *    axios 会等整个 body 读完才返回，无法做"一边生成一边渲染"。
+ *    EventSource 也不行，它只支持 GET，不支持 POST body。
+ *    所以这是项目里唯一允许直接调 fetch 的地方，其它业务代码必须走 ./api 的 axios 封装。
  */
 import { BASE_URL, getAccessToken, ApiError } from './api'
 
@@ -12,6 +15,10 @@ export { ApiError }
 
 export interface StreamChunkEvent {
   text: string
+}
+export interface StreamMetaEvent {
+  intent: 'edit' | 'analyze' | 'chat'
+  ask: 'none' | 'choice' | 'confirm'
 }
 export interface StreamDoneEvent {
   text: string
@@ -23,6 +30,13 @@ export interface StreamErrorEvent {
 
 export interface StreamHandlers {
   onDelta?: (delta: string) => void
+  /**
+   * 后端在流式 chunk 攒齐头部协议后**立刻**推过来的结构化 meta。
+   * - intent: AI 对文档的态度（edit/analyze/chat）
+   * - ask: AI 是否在等用户做选择（none/choice/confirm）
+   * 只要拿到，前端就能直接显示对应 UI，**不再依赖从 text 文本里正则解析**。
+   */
+  onMeta?: (meta: StreamMetaEvent) => void
   onDone?: (payload: StreamDoneEvent) => void
   onError?: (payload: StreamErrorEvent) => void
 }
@@ -100,6 +114,10 @@ export async function postStream(
       const text = (payload as StreamChunkEvent)?.text ?? ''
       fullText += text
       handlers.onDelta?.(text)
+    } else if (currentEvent === 'meta') {
+      // 后端解析出头部协议后第一时间推过来的结构化字段
+      // 前端不再需要从 text 文本里正则挖 [INTENT]/[ASK]
+      handlers.onMeta?.(payload as StreamMetaEvent)
     } else if (currentEvent === 'done') {
       const p = payload as StreamDoneEvent
       // 兜底：若 done 自带 text 但 chunk 没汇齐，用 done.text 补上
