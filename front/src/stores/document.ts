@@ -297,6 +297,13 @@ export const useDocumentStore = defineStore('document', () => {
     'juejin'
   ])
 
+  /**
+   * edit 流式过程中 pendingDiff 的"刷新次数"——每 30ms 重算一次就 +1。
+   * UI 用它显示"实时对比中 · 第 N 次"，让用户感知到"分片对比"在工作。
+   * 流结束（acceptPendingDiff / rejectPendingDiff）时清零。
+   */
+  const pendingDiffRevision = ref(0)
+
   const current = computed<DocumentItem | null>(() => {
     if (!currentId.value) return null
     return documents.value.find((d) => d.id === currentId.value) ?? null
@@ -770,16 +777,21 @@ export const useDocumentStore = defineStore('document', () => {
     // AI 自己声明的"是否在等用户做选择"，由结构化协议 [ASK:xxx] 决定
     let detectedAsk: AiAsk = 'none'
 
-    // 打开"实时预览"，先以未识别状态启动
-    // 如果 forceMode 已指定，preview.mode 直接给定（避免流式中闪"未识别"）
-    streamingPreview.value = {
-      docId: doc.id,
-      preContent: baseContent,
-      accumulated: '',
-      rawBuffer: '',
-      mode: detected,
-      prompt: opts.prompt ?? ''
-    }
+    // streamingPreview 的角色变化：
+    // - chat/analyze 模式 → 右栏用它判断"AI 正在打字"（isChatStreaming）
+    // - edit 模式 → 不维护（让中央 diff 视图独占，实时刷新）
+    // 这样后端流式回来时，前端**立刻**根据已检测到的 intent 分流，不用等流结束
+    streamingPreview.value =
+      detected === 'edit'
+        ? null
+        : {
+            docId: doc.id,
+            preContent: baseContent,
+            accumulated: '',
+            rawBuffer: '',
+            mode: detected,
+            prompt: opts.prompt ?? ''
+          }
 
     /**
      * 从累积的原始文本里解析协议头（新版三行结构 + 旧版单行兼容）。
@@ -827,13 +839,52 @@ export const useDocumentStore = defineStore('document', () => {
     }
 
     // 更新 streamingPreview（一次性塞新对象，触发响应式）
+    // edit 模式不维护 streamingPreview——让中央 diff 视图独占
     function pushPreview() {
+      if (detected === 'edit') {
+        streamingPreview.value = null
+        return
+      }
       if (!streamingPreview.value) return
       streamingPreview.value = {
         ...streamingPreview.value,
         accumulated: contentBuffer,
         rawBuffer,
         mode: detected
+      }
+    }
+
+    /**
+     * edit 模式实时算 diff 写 pendingDiff，让中央 diff 视图在 AI 流式打字过程中实时刷新。
+     * 这就是"分片对比"——AI 边写，diff 边成形，用户看到行级绿/红增量。
+     *
+     * 30ms 节流（≈30fps）：流式 chunk 通常 50-100ms 一个，30ms 节流保证每收到 1~2 个 chunk
+     * 就重算一次 diff，视觉上"分片对比"非常顺滑。diffLines 对中等长度 markdown
+     * （< 5000 字）耗时 < 5ms，30fps 完全扛得住。
+     */
+    let pendingDiffTimer: ReturnType<typeof setTimeout> | null = null
+    // 局部计数器：每次 flushPushPendingDiff 触发，pendingDiffRevision.value++
+    function schedulePushPendingDiff() {
+      if (pendingDiffTimer) return
+      pendingDiffTimer = setTimeout(() => {
+        pendingDiffTimer = null
+        flushPushPendingDiff()
+      }, 30)
+    }
+    function flushPushPendingDiff() {
+      if (pendingDiffTimer) {
+        clearTimeout(pendingDiffTimer)
+        pendingDiffTimer = null
+      }
+      const cleaned = stripProtocolInline(contentBuffer)
+      const diffParts = diffLines(baseContent, cleaned)
+      pendingDiffRevision.value++
+      pendingDiff.value = {
+        docId: doc.id,
+        preContent: baseContent,
+        postContent: cleaned,
+        diffParts,
+        prompt: opts.prompt ?? ''
       }
     }
 
@@ -872,7 +923,7 @@ export const useDocumentStore = defineStore('document', () => {
 
     try {
       const contextText = opts.contextText ?? (baseContent.trim() ? baseContent : undefined)
-      const fullText = await postStream(
+      await postStream(
         '/api/ai/generate',
         {
           prompt: opts.prompt ?? '',
@@ -884,6 +935,7 @@ export const useDocumentStore = defineStore('document', () => {
           history
         },
         {
+          // 每个流式 chunk 进来——立刻分流，**不等流结束**
           onDelta(delta) {
             rawBuffer += delta
             if (detected === null) {
@@ -895,6 +947,9 @@ export const useDocumentStore = defineStore('document', () => {
                 detected = parsed.intent
                 detectedAsk = parsed.ask
                 contentBuffer = parsed.body
+                if (detected === 'edit') {
+                  schedulePushPendingDiff() // edit 模式：立刻初始化 diff
+                }
                 pushPreview()
                 return
               }
@@ -902,7 +957,10 @@ export const useDocumentStore = defineStore('document', () => {
             } else {
               // 已分流：本轮 chunk 全是正文
               contentBuffer += delta
-              pushPreview()
+              if (detected === 'edit') {
+                schedulePushPendingDiff() // edit 模式：实时刷新 diff
+              }
+              pushPreview() // chat/analyze：实时更新 streamingPreview
             }
           },
           // 后端结构化 meta 事件：拿到就立刻分流（**权威信号**）
@@ -913,56 +971,41 @@ export const useDocumentStore = defineStore('document', () => {
             detectedAsk = meta.ask
             // 把 rawBuffer 头部协议也剥掉，避免内容里残留协议字面引用
             contentBuffer = stripProtocolInline(rawBuffer)
+            if (detected === 'edit') {
+              schedulePushPendingDiff() // edit 模式：立刻初始化 diff
+            }
             pushPreview()
           }
         }
       )
-      console.log('当前ai请求得到的结果：');
-      console.log(fullText);
-      if (fullText) {
-        // 用最终全文重算（兼容后端在 done 事件里给到的最终字符串）
-        rawBuffer = fullText
-        if (detected === null) {
-          const parsed = tryParseHeader(rawBuffer) ?? fallbackHeader()
-          detected = parsed.intent
-          detectedAsk = parsed.ask
-          contentBuffer = parsed.body
-        }
-        pushPreview()
-      }
 
       const finalMode: AiIntent = detected ?? 'chat' // AI 没出协议 → 当 chat（最安全，不动文档）
-
-      // 兜底：剥掉正文里残留的 [INTENT/ASK/CONTENT] 字面引用（AI 偶尔会当示例写出来）
       const cleanedContent = stripProtocolInline(contentBuffer)
 
-      console.log(finalMode, detectedAsk);
-      // ============ analyze / chat：直接进 chatThread，不动文档 ============
+      // AI 完全没出协议头时（罕见），走 fallbackHeader 智能判断 ask
+      if (detected === null) {
+        const fb = fallbackHeader()
+        detectedAsk = fb.ask
+      }
+
+      // ============ analyze / chat：流结束后才进 chatThread（避免流式中提前出现正式消息） ============
       if (finalMode === 'analyze' || finalMode === 'chat') {
         recordConversation(opts.prompt ?? '', cleanedContent, finalMode, detectedAsk)
         streamingPreview.value = null
         return { content: cleanedContent, mode: finalMode }
       }
 
-      // ============ edit：进入 pendingDiff 等用户接受/拒绝 ============
-      // 计算行级 diff，给 UI 展示"AI 改了哪些行"
-      // 用 cleanedContent 而不是原始 contentBuffer，把残留的协议标记字样也剥掉
-      const postContent = cleanedContent || stripProtocolInline(rawBuffer)
-      const diffParts = diffLines(baseContent, postContent)
-
+      // ============ edit：flush 最后一次 diff，确保用的是完整内容 ============
+      flushPushPendingDiff()
       streamingPreview.value = null
-      pendingDiff.value = {
-        docId: doc.id,
-        preContent: baseContent,
-        postContent,
-        diffParts,
-        prompt: opts.prompt ?? ''
-      }
-
       // edit 模式下 user/AI 消息不在这里加，等用户点"接受"再追加（拒绝则整个一轮都不算）
-      return { content: postContent, mode: 'edit' }
+      return { content: cleanedContent, mode: 'edit' }
     } catch (err) {
-      // 出错时也清掉实时预览，避免残留
+      // 出错时清掉实时预览和定时器，避免残留
+      if (pendingDiffTimer) {
+        clearTimeout(pendingDiffTimer)
+        pendingDiffTimer = null
+      }
       streamingPreview.value = null
       if (err instanceof ApiError) throw err
       throw new ApiError(0, 'GENERATE_FAILED', (err as Error)?.message ?? 'AI 生成失败')
@@ -1130,6 +1173,7 @@ export const useDocumentStore = defineStore('document', () => {
     chatThread,
     streamingPreview,
     pendingDiff,
+    pendingDiffRevision,
     pendingDiffSummary,
     currentId,
     current,

@@ -298,26 +298,41 @@ watch(
         </div>
       </div>
 
-      <!-- AI 改动顶部操作条：接受/拒绝 + 统计；diff 主体在 ce-body 渲染 -->
+      <!-- AI 改动顶部操作条：流式过程显示"正在改…"，流结束后显示"接受/拒绝 + 统计"；diff 主体在 ce-body 实时刷新 -->
       <div v-else-if="store.pendingDiff" class="ai-diff-bar">
-        <div class="ai-diff-bar__title">
-          <el-icon><MagicStick /></el-icon>
-          <span>AI 提议的改动</span>
-          <em class="ai-diff-bar__stats">
-            <span class="diff-stat diff-stat--add">+{{ store.pendingDiffSummary.added }}</span>
-            <span class="diff-stat diff-stat--del">-{{ store.pendingDiffSummary.removed }}</span>
-          </em>
-        </div>
-        <div class="ai-diff-bar__actions">
-          <button class="diff-btn diff-btn--ghost" @click="rejectDiff">
-            <el-icon><CircleClose /></el-icon>
-            <span>拒绝</span>
-          </button>
-          <button class="diff-btn diff-btn--primary" @click="acceptDiff">
-            <el-icon><Check /></el-icon>
-            <span>接受</span>
-          </button>
-        </div>
+        <!-- 流式中：实时状态 -->
+        <template v-if="store.isGenerating">
+          <div class="ai-diff-bar__title">
+            <span class="ai-diff-bar__dot" />
+            <span>AI 正在改文档…</span>
+            <em class="ai-diff-bar__prompt">{{ store.pendingDiff.prompt }}</em>
+            <em class="ai-diff-bar__stats">
+              <span class="diff-stat diff-stat--add">+{{ store.pendingDiffSummary.added }}</span>
+              <span class="diff-stat diff-stat--del">-{{ store.pendingDiffSummary.removed }}</span>
+            </em>
+          </div>
+        </template>
+        <!-- 流结束：接受/拒绝 -->
+        <template v-else>
+          <div class="ai-diff-bar__title">
+            <el-icon><MagicStick /></el-icon>
+            <span>AI 提议的改动</span>
+            <em class="ai-diff-bar__stats">
+              <span class="diff-stat diff-stat--add">+{{ store.pendingDiffSummary.added }}</span>
+              <span class="diff-stat diff-stat--del">-{{ store.pendingDiffSummary.removed }}</span>
+            </em>
+          </div>
+          <div class="ai-diff-bar__actions">
+            <button class="diff-btn diff-btn--ghost" @click="rejectDiff">
+              <el-icon><CircleClose /></el-icon>
+              <span>拒绝</span>
+            </button>
+            <button class="diff-btn diff-btn--primary" @click="acceptDiff">
+              <el-icon><Check /></el-icon>
+              <span>接受</span>
+            </button>
+          </div>
+        </template>
       </div>
 
       <div ref="diffBodyRef" class="ce-body">
@@ -474,6 +489,26 @@ watch(
   font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--text-primary);
+}
+.ai-diff-bar__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-brand);
+  box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.4);
+  animation: pulse 1.2s infinite;
+  flex-shrink: 0;
+}
+.ai-diff-bar__prompt {
+  font-style: normal;
+  font-size: var(--fs-xs);
+  font-weight: 400;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
 }
 .ai-diff-bar__title .el-icon {
   color: var(--color-brand);
