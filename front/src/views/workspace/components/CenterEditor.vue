@@ -307,6 +307,7 @@ watch(
             <span>AI 正在改文档…</span>
             <em class="ai-diff-bar__prompt">{{ store.pendingDiff.prompt }}</em>
             <em class="ai-diff-bar__stats">
+              <span class="diff-stat diff-stat--live">实时对比 · 第 {{ store.pendingDiffRevision }} 次</span>
               <span class="diff-stat diff-stat--add">+{{ store.pendingDiffSummary.added }}</span>
               <span class="diff-stat diff-stat--del">-{{ store.pendingDiffSummary.removed }}</span>
             </em>
@@ -538,6 +539,17 @@ watch(
 .diff-stat--del {
   color: #b91c1c;
   background: rgba(239, 68, 68, 0.12);
+}
+/* 流式"实时对比"标识：紫色调 + 脉冲，让用户感知"分片对比"在工作 */
+.diff-stat--live {
+  color: var(--color-brand);
+  background: rgba(99, 102, 241, 0.1);
+  font-variant-numeric: tabular-nums;
+  animation: livePulse 1.4s ease-in-out infinite;
+}
+@keyframes livePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
 }
 .ai-diff-panel__actions {
   display: inline-flex;
