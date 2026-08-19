@@ -69,7 +69,7 @@ export async function postStream(
   if (!res.ok) {
     // 后端 SSE 在出错时会降级成普通 JSON（其实只有 5xx 才会进 errorHandler）。
     // 这里先尝试读一下 body，给一个友好错误。
-    let payload: { code?: string; message?: string } | undefined
+    let payload: { code?: number; errorCode?: string; message?: string } | undefined
     try {
       payload = (await res.json()) as typeof payload
     } catch {
@@ -77,13 +77,14 @@ export async function postStream(
     }
     throw new ApiError(
       res.status,
-      payload?.code ?? 'STREAM_HTTP_ERROR',
+      res.status,
+      payload?.errorCode ?? 'STREAM_HTTP_ERROR',
       payload?.message ?? `SSE 请求失败：HTTP ${res.status}`
     )
   }
 
   if (!res.body) {
-    throw new ApiError(0, 'NO_BODY', '响应没有 body')
+    throw new ApiError(0, 0, 'NO_BODY', '响应没有 body')
   }
 
   const reader = res.body.getReader()
@@ -126,7 +127,7 @@ export async function postStream(
     } else if (currentEvent === 'error') {
       const p = payload as StreamErrorEvent
       handlers.onError?.(p)
-      throw new ApiError(res.status, 'STREAM_ERROR', p.message ?? 'AI 生成失败')
+      throw new ApiError(res.status, res.status, 'STREAM_ERROR', p.message ?? 'AI 生成失败')
     }
   }
 

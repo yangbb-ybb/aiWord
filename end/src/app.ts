@@ -69,10 +69,17 @@ export async function buildApp() {
   // - 其他 → 500 INTERNAL_ERROR
   // ⚠️ 不要把未知 err.code 原样透传给前端，否则会把 ER_ACCESS_DENIED_ERROR 这种
   //   内部 mysql 错误码暴露给客户端。
+  //
+  // 统一响应信封（envelope）：
+  //   成功 → { code: <http_status>, data: T }
+  //   错误 → { code: <http_status>, message, errorCode?: string, details? }
+  // `code` 始终是数字 HTTP 状态码；前端可以从这里直接判断网络层是否成功，
+  // 不必再读 response.status。`errorCode` 是机器可读字符串（保留给业务分支用）。
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof ZodError) {
       return reply.code(400).send({
-        code: 'VALIDATION_ERROR',
+        code: 400,
+        errorCode: 'VALIDATION_ERROR',
         message: '请求参数不合法',
         details: err.flatten()
       })
@@ -80,11 +87,12 @@ export async function buildApp() {
     if (err instanceof AppError) {
       // 业务错误也写一条日志（warn 级别，状态码 4xx —— 不算异常）
       req.log.warn(
-        { code: err.code, statusCode: err.statusCode },
+        { errorCode: err.code, statusCode: err.statusCode },
         err.message
       )
       return reply.code(err.statusCode).send({
-        code: err.code,
+        code: err.statusCode,
+        errorCode: err.code,
         message: err.message,
         details: err.details
       })
@@ -92,15 +100,56 @@ export async function buildApp() {
     if (isDbError(err)) {
       req.log.error({ err }, 'database error')
       return reply.code(503).send({
-        code: 'DB_ERROR',
+        code: 503,
+        errorCode: 'DB_ERROR',
         message: '数据库服务暂时不可用'
       })
     }
     req.log.error(err)
     return reply.code(500).send({
-      code: 'INTERNAL_ERROR',
+      code: 500,
+      errorCode: 'INTERNAL_ERROR',
       message: 'Internal Server Error'
     })
+  })
+
+  /**
+   * 全局响应包装：所有非 SSE / 非错误的 JSON 响应都包成 { code, data }。
+   * - 已经带 `code` 字段（错误响应）→ 不重复包装
+   * - content-type 是 text/event-stream（SSE）→ 不包装（保持原始事件流；且 SSE 走
+   *   reply.raw.write()，根本不会进入 preSerialization / onSend 链路，这里无需判断）
+   * - 二进制响应（Buffer）→ 不动
+   * - 否则包成 { code: <http_status>, data: <原 payload> }
+   *
+   * 注意：必须用 **preSerialization** 而不是 onSend！
+   *   - Fastify v4 的 onSend 收到的是**已经序列化**的 string/Buffer，hook 返回对象
+   *     不会再被 JSON.stringify，会直接报 `FST_ERR_REP_INVALID_PAYLOAD_TYPE`。
+   *   - preSerialization 在序列化之前运行，可以返回对象，Fastify 会用默认 JSON
+   *     serializer 把返回的对象字符串化。
+   */
+  app.addHook('preSerialization', async (req, reply, payload) => {
+    // 二进制响应（如 /export 返回的 Buffer）→ 不动，让 Fastify 原样发送
+    if (Buffer.isBuffer(payload)) return payload
+    // 已经是 envelope（错误响应）→ 透传
+    if (payload && typeof payload === 'object' && 'code' in payload) {
+      // 兼容旧格式：string code → 转成新格式（数字 code + errorCode）
+      const obj = payload as Record<string, unknown>
+      if (typeof obj.code === 'string') {
+        return {
+          code: reply.statusCode || 500,
+          errorCode: obj.code,
+          message: obj.message ?? obj.code,
+          details: obj.details
+        }
+      }
+      return payload
+    }
+    // null / undefined payload（204 等）：包成 { code, data: null }（保留 HTTP 状态）
+    if (payload == null) {
+      return { code: reply.statusCode || 200, data: null }
+    }
+    // 普通对象 / 其它 payload：包成 { code, data }
+    return { code: reply.statusCode || 200, data: payload }
   })
 
   // 简单 API key 校验中间件（写操作）
@@ -109,7 +158,11 @@ export async function buildApp() {
     if (req.method === 'GET' || req.method === 'OPTIONS') return
     const got = req.headers['x-api-key']
     if (got !== env.AUTH_TOKEN) {
-      return reply.code(401).send({ code: 'UNAUTHORIZED' })
+      return reply.code(401).send({
+        code: 401,
+        errorCode: 'UNAUTHORIZED',
+        message: 'API Key 无效'
+      })
     }
   })
 

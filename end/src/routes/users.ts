@@ -35,18 +35,18 @@ export default async function usersRoutes(app: FastifyInstance) {
 
   /** 更新当前用户资料 */
   app.put('/me', { preHandler: app.authRequired }, async (req, reply) => {
-    if (!req.user) return reply.code(401).send({ code: 'UNAUTHORIZED' })
+    if (!req.user) return reply.code(401).send({ code: 401, errorCode: 'UNAUTHORIZED', message: '请先登录' })
     const body = updateMeBody.parse(req.body)
     const userId = Number(req.user.id)
 
     if (body.email !== undefined && body.email !== null) {
       if (await isContactTaken('email', body.email, userId)) {
-        return reply.code(409).send({ code: 'EMAIL_TAKEN', message: '邮箱已被占用' })
+        return reply.code(409).send({ code: 409, errorCode: 'EMAIL_TAKEN', message: '邮箱已被占用' })
       }
     }
     if (body.phone !== undefined && body.phone !== null) {
       if (await isContactTaken('phone', body.phone, userId)) {
-        return reply.code(409).send({ code: 'PHONE_TAKEN', message: '手机号已被占用' })
+        return reply.code(409).send({ code: 409, errorCode: 'PHONE_TAKEN', message: '手机号已被占用' })
       }
     }
 
@@ -56,27 +56,31 @@ export default async function usersRoutes(app: FastifyInstance) {
       email: body.email,
       phone: body.phone
     })
-    if (!updated) return reply.code(404).send({ code: 'NOT_FOUND' })
+    if (!updated) return reply.code(404).send({ code: 404, errorCode: 'NOT_FOUND', message: '用户不存在' })
     return { user: toPublic(updated) }
   })
 
   /** 修改密码（需旧密码） */
   app.put('/me/password', { preHandler: app.authRequired }, async (req, reply) => {
-    if (!req.user) return reply.code(401).send({ code: 'UNAUTHORIZED' })
+    if (!req.user) return reply.code(401).send({ code: 401, errorCode: 'UNAUTHORIZED', message: '请先登录' })
     const body = changePasswordBody.parse(req.body)
     const userId = Number(req.user.id)
 
     const row = await findUserById(userId)
-    if (!row) return reply.code(404).send({ code: 'NOT_FOUND' })
+    if (!row) return reply.code(404).send({ code: 404, errorCode: 'NOT_FOUND', message: '用户不存在' })
     if (!row.passwordHash) {
       return reply
         .code(400)
-        .send({ code: 'NO_PASSWORD', message: '该账号未设置密码（请用短信登录）' })
+        .send({ code: 400, errorCode: 'NO_PASSWORD', message: '该账号未设置密码（请用短信登录）' })
     }
     const ok = await verifyPassword(body.oldPassword, row.passwordHash)
     if (!ok) {
       const e = authError('INVALID_OLD_PASSWORD', '旧密码错误')
-      return reply.code(e.statusCode).send({ code: e.code, message: e.message })
+      return reply.code(e.statusCode).send({
+        code: e.statusCode,
+        errorCode: e.code,
+        message: e.message
+      })
     }
     await updateUser(userId, {
       passwordHash: await hashPassword(body.newPassword)

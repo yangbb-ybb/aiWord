@@ -65,7 +65,8 @@ function ensureAiAvailable(req: any, reply: any): boolean {
   } catch (e: any) {
     req.log.error({ aiEvent: 'no_api_key', err: e }, 'AI service not configured')
     reply.code(503).send({
-      code: 'AI_NOT_CONFIGURED',
+      code: 503,
+      errorCode: 'AI_NOT_CONFIGURED',
       message:
         'AI 服务未配置 API Key。请在 end/.env 里设置 MINIMAX_API_KEY 或 ANTHROPIC_API_KEY 后重启后端。'
     })

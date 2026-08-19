@@ -77,10 +77,10 @@ export default async function authRoutes(app: FastifyInstance) {
   app.post('/register', async (req, reply) => {
     const body = registerBody.parse(req.body)
     if (await isContactTaken('email', body.email)) {
-      return reply.code(409).send({ code: 'EMAIL_TAKEN', message: '邮箱已被注册' })
+      return reply.code(409).send({ code: 409, errorCode: 'EMAIL_TAKEN', message: '邮箱已被注册' })
     }
     if (body.phone && (await isContactTaken('phone', body.phone))) {
-      return reply.code(409).send({ code: 'PHONE_TAKEN', message: '手机号已被注册' })
+      return reply.code(409).send({ code: 409, errorCode: 'PHONE_TAKEN', message: '手机号已被注册' })
     }
     const user = await createUser({
       nickname: body.nickname,
@@ -100,15 +100,15 @@ export default async function authRoutes(app: FastifyInstance) {
     const body = loginBody.parse(req.body)
     const user = await findUserByEmail(body.email)
     if (!user || !user.passwordHash) {
-      return reply.code(401).send({ code: 'INVALID_CREDENTIALS', message: '邮箱或密码错误' })
+      return reply.code(401).send({ code: 401, errorCode: 'INVALID_CREDENTIALS', message: '邮箱或密码错误' })
     }
     const ok = await verifyPassword(body.password, user.passwordHash)
     if (!ok) {
-      return reply.code(401).send({ code: 'INVALID_CREDENTIALS', message: '邮箱或密码错误' })
+      return reply.code(401).send({ code: 401, errorCode: 'INVALID_CREDENTIALS', message: '邮箱或密码错误' })
     }
 
     if (user.status !== 'active') {
-      return reply.code(403).send({ code: 'USER_BANNED', message: '账号已被禁用' })
+      return reply.code(403).send({ code: 403, errorCode: 'USER_BANNED', message: '账号已被禁用' })
     }
     return {
       user: toPublic(user),
@@ -157,7 +157,7 @@ export default async function authRoutes(app: FastifyInstance) {
       )
       return reply
         .code(400)
-        .send({ code: 'SMS_INVALID', message: '验证码错误或已过期' })
+        .send({ code: 400, errorCode: 'SMS_INVALID', message: '验证码错误或已过期' })
     }
     let user = await findUserByPhone(body.phone)
     let isNewUser = false
@@ -179,7 +179,7 @@ export default async function authRoutes(app: FastifyInstance) {
         },
         'sms login blocked: user banned'
       )
-      return reply.code(403).send({ code: 'USER_BANNED', message: '账号已被禁用' })
+      return reply.code(403).send({ code: 403, errorCode: 'USER_BANNED', message: '账号已被禁用' })
     }
     const tokens = {
       accessToken: signAccessToken(user),
@@ -218,7 +218,8 @@ export default async function authRoutes(app: FastifyInstance) {
     } catch (err) {
       const e = err as ReturnType<typeof authError>
       return reply.code(e.statusCode ?? 401).send({
-        code: e.code ?? 'REFRESH_INVALID',
+        code: e.statusCode ?? 401,
+        errorCode: e.code ?? 'REFRESH_INVALID',
         message: e.message ?? 'refresh 失败'
       })
     }
@@ -248,7 +249,7 @@ export default async function authRoutes(app: FastifyInstance) {
     '/wechat/qrcode/:sceneId',
     async (req, reply) => {
       const session = await getSession(req.params.sceneId)
-      if (!session) return reply.code(404).send({ code: 'SCENE_NOT_FOUND' })
+      if (!session) return reply.code(404).send({ code: 404, errorCode: 'SCENE_NOT_FOUND', message: '二维码不存在或已过期' })
       const base = {
         sceneId: session.id,
         status: session.status,
@@ -262,7 +263,7 @@ export default async function authRoutes(app: FastifyInstance) {
           const rows = await db.select().from(users).where(eq(users.id, session.userId!)).limit(1)
           return rows[0]
         })
-        if (!user) return reply.code(500).send({ code: 'USER_GONE' })
+        if (!user) return reply.code(500).send({ code: 500, errorCode: 'USER_GONE', message: '用户已不存在' })
         return {
           ...base,
           user: toPublic(user),
@@ -289,7 +290,8 @@ export default async function authRoutes(app: FastifyInstance) {
       } catch (err) {
         const e = err as ReturnType<typeof wechatError>
         return reply.code(e.statusCode ?? 400).send({
-          code: e.code ?? 'CONFIRM_FAILED',
+          code: e.statusCode ?? 400,
+          errorCode: e.code ?? 'CONFIRM_FAILED',
           message: e.message ?? '确认失败'
         })
       }
@@ -301,7 +303,7 @@ export default async function authRoutes(app: FastifyInstance) {
     '/wechat/bind-phone',
     { preHandler: app.authRequired },
     async (req, reply) => {
-      if (!req.user) return reply.code(401).send({ code: 'UNAUTHORIZED' })
+      if (!req.user) return reply.code(401).send({ code: 401, errorCode: 'UNAUTHORIZED', message: '请先登录' })
       const body = bindPhoneBody.parse(req.body)
       try {
         await bindPhoneForUser(Number(req.user.id), body.phone, body.smsCode)
@@ -309,7 +311,8 @@ export default async function authRoutes(app: FastifyInstance) {
       } catch (err) {
         const e = err as ReturnType<typeof wechatError>
         return reply.code(e.statusCode ?? 400).send({
-          code: e.code ?? 'BIND_FAILED',
+          code: e.statusCode ?? 400,
+          errorCode: e.code ?? 'BIND_FAILED',
           message: e.message ?? '绑定失败'
         })
       }

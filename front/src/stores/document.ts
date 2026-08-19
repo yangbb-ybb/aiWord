@@ -1008,7 +1008,7 @@ export const useDocumentStore = defineStore('document', () => {
       }
       streamingPreview.value = null
       if (err instanceof ApiError) throw err
-      throw new ApiError(0, 'GENERATE_FAILED', (err as Error)?.message ?? 'AI 生成失败')
+      throw new ApiError(0, 0, 'GENERATE_FAILED', (err as Error)?.message ?? 'AI 生成失败')
     } finally {
       isGenerating.value = false
     }

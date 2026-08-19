@@ -47,7 +47,7 @@ export default async function documentsRoutes(app: FastifyInstance) {
   app.get('/:id', async (req, reply) => {
     const { id } = idParam.parse(req.params)
     const doc = await getDocument(id, Number(req.user!.id))
-    if (!doc) return reply.code(404).send({ code: 'NOT_FOUND' })
+    if (!doc) return reply.code(404).send({ code: 404, errorCode: 'NOT_FOUND', message: '文档不存在' })
     return doc
   })
 
@@ -62,7 +62,7 @@ export default async function documentsRoutes(app: FastifyInstance) {
     const { id } = idParam.parse(req.params)
     const body = updateBody.parse(req.body)
     const doc = await updateDocument(id, body, Number(req.user!.id))
-    if (!doc) return reply.code(404).send({ code: 'NOT_FOUND' })
+    if (!doc) return reply.code(404).send({ code: 404, errorCode: 'NOT_FOUND', message: '文档不存在' })
     return doc
   })
 
@@ -75,7 +75,7 @@ export default async function documentsRoutes(app: FastifyInstance) {
   app.delete('/:id', async (req, reply) => {
     const { id } = idParam.parse(req.params)
     const ok = await deleteDocument(id, Number(req.user!.id))
-    if (!ok) return reply.code(404).send({ code: 'NOT_FOUND' })
+    if (!ok) return reply.code(404).send({ code: 404, errorCode: 'NOT_FOUND', message: '文档不存在' })
     reply.code(204)
     return null
   })
@@ -84,7 +84,7 @@ export default async function documentsRoutes(app: FastifyInstance) {
   app.post('/:id/restore', async (req, reply) => {
     const { id } = idParam.parse(req.params)
     const doc = await restoreDocument(id, Number(req.user!.id))
-    if (!doc) return reply.code(404).send({ code: 'NOT_FOUND' })
+    if (!doc) return reply.code(404).send({ code: 404, errorCode: 'NOT_FOUND', message: '文档不存在' })
     return doc
   })
 
@@ -92,7 +92,7 @@ export default async function documentsRoutes(app: FastifyInstance) {
   app.delete('/:id/permanent', async (req, reply) => {
     const { id } = idParam.parse(req.params)
     const ok = await purgeDocument(id, Number(req.user!.id))
-    if (!ok) return reply.code(404).send({ code: 'NOT_FOUND' })
+    if (!ok) return reply.code(404).send({ code: 404, errorCode: 'NOT_FOUND', message: '文档不存在' })
     reply.code(204)
     return null
   })
