@@ -131,6 +131,19 @@ const PROTOCOL_HEADER_RE =
 const INTENT_ONLY_RE = /\s*\[INTENT:(edit|analyze|chat)\]/i
 
 /**
+ * 注入到 messages 末尾的 assistant prefill —— 用 `[INTENT:` 开头物理上强制模型
+ * 续写协议头（Anthropic API 提供 prefill 续写机制，模型必须从 prefill 之后开始写）。
+ *
+ * 风险 & 兜底：minimax（Anthropic 协议代理）经常**忽略** prefill 自己重写整个协议头，
+ * 之前直接 `prefill + delta` 拼回去就会出现 `[INTENT:[INTENT:edit]...` 双前缀污染
+ * rawBuffer 和用户输出。streamWith 里 head-gate 负责判断模型选了哪条路再决定拼不拼。
+ */
+export const PROTOCOL_PREFILL = '[INTENT:'
+
+/** 探针字符数：足够区分"续写 / 重写 / 跳过"三种模型行为（见 streamWith head-gate 注释） */
+const HEAD_PROBE_CHARS = 24
+
+/**
  * 尝试从累积文本里解析头部声明。命中 → { intent, ask, body }；没命中 → null。
  */
 export function parseStreamMeta(raw: string): StreamMeta | null {
@@ -149,6 +162,42 @@ export function parseStreamMeta(raw: string): StreamMeta | null {
     }
   }
   return null
+}
+
+/** 正文里残留的协议标记（与前端 stores/document.ts 的 stripProtocolInline 保持一致） */
+const PROTOCOL_INLINE_RE = /\s*\[(?:INTENT|ASK|CONTENT)(?::[^\]]*)?\]\s*/gi
+
+/**
+ * 选项行识别：`- **路径 A**：描述` 或退化的 `- **A**：描述`（模型经常省掉"路径"二字）。
+ * 与前端 parseChoices 的 pattern 1 对齐——这里判 choice 而前端解析不出来的话，
+ * RightPanel 的 `choicesOf(msg).length >= 1` 会挡住空弹窗，两边不一致也只是少弹，不会崩。
+ */
+const CHOICE_LINE_RE =
+  /^\s*[-*]\s+\*\*\s*(?:路径|方案|选项|思路|方向|建议|选择|模式|Path|Option|Idea|Approach)?\s*[A-Da-d]\s*\*\*\s*[:：]/m
+
+/**
+ * AI 完全没输出协议头时的兜底判定。
+ *
+ * 之前这里无脑当 `chat` 处理，代价是：模型明明重写了整篇文档，前端却按"聊天"分流 ——
+ * 整篇 markdown 被塞进右栏气泡，文档一个字没改，用户看起来就是"AI 没按要求输出"。
+ * （2026-08-20 日志 reqId=mt17sv4fr0g8r6m3 就是这个场景：模型跳过协议头直接写
+ *  "以下是增加时间后的完整文档：" + ```markdown 围栏）
+ *
+ * 所以改成看正文结构：像"一整篇文档"就按 edit 走，让用户至少能在 diff 视图里接受/拒绝；
+ * 拿不准时仍然退回 chat（不动文档，最安全）。
+ */
+export function inferMetaFromBody(raw: string): StreamMeta {
+  const text = raw.replace(PROTOCOL_INLINE_RE, '').trim()
+  // ```markdown 围栏包住的整块 —— 模型用围栏交付"完整新文档"的典型形态
+  const fenced = text.match(/```(?:markdown|md)?\s*\n([\s\S]*?)```/i)
+  const doc = fenced ? fenced[1] : text
+  const headings = (doc.match(/^#{1,6}\s+\S/gm) ?? []).length
+  // 有围栏时 1 个标题就够；没围栏时要求 2 个标题 + 200 字，避免把"聊天里顺手写个 ## 小标题"误判成改文档
+  const isDocument = fenced ? headings >= 1 : headings >= 2 && doc.length >= 200
+  return {
+    intent: isDocument ? 'edit' : 'chat',
+    ask: CHOICE_LINE_RE.test(text) ? 'choice' : 'none'
+  }
 }
 
 /**
@@ -212,11 +261,8 @@ async function streamWith(
   prefill?: string
 ) {
   const provider = getProvider()
-  // 累积 buffer：chunked 传输里协议头可能被切成多片，必须攒齐才能匹配。
-  // 关键！rawBuffer 必须**始终包含注入的 prefill**，这样无论模型是否自己重新输出
-  // 协议头（实测 minimax/Anthropic 经常忽略 prefill、完整输出 [INTENT:[INTENT:edit]...），
-  // 我们都至少能匹配到完整的 `[INTENT:edit]\n[ASK:xxx]\n[CONTENT]` 子串。
-  // rawBuffer 累积完成后靠 parseStreamMeta 的非锚定正则兜底匹配（去掉 ^\s*）。
+  // rawBuffer 始终包含 prefill（拼过就拼，没拼过就不拼），保证 parseStreamMeta 的非锚定正则
+  // 能找到完整 `[INTENT:edit]\n[ASK:xxx]\n[CONTENT]`。用户实际看到的 onChunk 输出走另一条路。
   let rawBuffer = ''
   let metaFired = false
   const handleDelta = (delta: string) => {
@@ -229,21 +275,65 @@ async function streamWith(
       }
     }
   }
-  // 第一次进 wrappedChunk 时，如果用了 prefill，把 prefill 拼到 chunk 前面
-  // 让前端能看到完整协议头 '[INTENT:edit]\n[ASK:none]\n[CONTENT]\n'
-  // 而不是只看到模型续写的 'edit]\n[ASK:none]\n[CONTENT]\n'（缺 [INTENT: 前缀）
-  let prefillInjected = false
-  const wrappedChunk = (delta: string) => {
-    if (prefill && !prefillInjected) {
-      prefillInjected = true
-      const full = prefill + delta
-      handleDelta(full)
-      onChunk(full)
-    } else {
-      handleDelta(delta)
-      onChunk(delta)
+
+  // ====== prefill 拼接 head-gate ======
+  // 模型对 prefill `[INTENT:` 有三种反应，stream 必须给前端看到**一致**的内容：
+  //   A. 顺着续写（推荐路径）：模型输出 `edit]\n[ASK:none]\n[CONTENT]\n` —— 拼回 prefill 前缀
+  //   B. 忽略 prefill、重写整段协议头：模型输出 `[INTENT:edit]\n[ASK:none]\n[CONTENT]\n` —— **不**拼
+  //      否则会出现 `[INTENT:[INTENT:edit]...` 双前缀污染 rawBuffer 和用户输出
+  //   C. 完全跳过协议头，直接写正文（如 "以下是增加时间后的完整文档：" + 围栏）：
+  //      **不**拼 prefill，让前端的 fallback 逻辑走 inferMetaFromBody 按"完整文档"分流到 edit
+  //
+  // 区分 A/B/C 只需看模型第一个 chunk 的前 16~24 字符：
+  //   A: 模型首个 chunk 以 `[A-Za-z]` 续写（如 `edit]\n`）
+  //   B: 模型首个 chunk 以 `[INTENT:` 开头
+  //   C: 模型首个 chunk 是其他字符（中文 / 英文 / ```）
+  // 因此攒够 HEAD_PROBE_CHARS 字符再决定拼不拼 prefill，把首包作为整体 flush 给 onChunk，
+  // 决策时机延迟到首包读完之后——延迟肉眼不可见（≈20ms 内）。
+  let prefillInjected: string = prefill ? 'pending' : 'no'
+  let headBuffer = ''
+  const flushHead = () => {
+    if (prefillInjected !== 'pending') return
+    if (!prefill) {
+      prefillInjected = 'no'
+      return
     }
+    // B：模型自己重写了协议头 → 不拼
+    if (/^\[INTENT:/.test(headBuffer)) {
+      prefillInjected = 'no'
+      return
+    }
+    // A：模型以小写字母续写（如 `edit]` / `analyze]` / `chat]`）→ 拼回 prefill
+    if (/^[a-z]{3,7}\]/.test(headBuffer)) {
+      prefillInjected = 'yes'
+      return
+    }
+    // C：模型跳过了协议头 → 不拼，让前端 fallback 接管
+    prefillInjected = 'no'
   }
+
+  const wrappedChunk = (delta: string) => {
+    if (prefillInjected === 'pending') {
+      headBuffer += delta
+      if (headBuffer.length >= HEAD_PROBE_CHARS) {
+        flushHead()
+        // 首包作为整体推给下游（带或不带 prefill 前缀）
+        // 类型断言绕开 TS 控制流窄化（块内 prefillInjected 被收窄成 'pending'，无法直比 'yes'）
+        const state = prefillInjected as string
+        const stitchPrefill = state === 'yes'
+        const toForward = stitchPrefill && prefill ? prefill + headBuffer : headBuffer
+        handleDelta(toForward)
+        onChunk(toForward)
+      } else {
+        // 还没攒够探测字符 → 仅累积 rawBuffer，不向前端推（避免半截前缀泄漏）
+        handleDelta(delta)
+      }
+      return
+    }
+    handleDelta(delta)
+    onChunk(delta)
+  }
+
   // 把 prefill 作为最后一条 assistant 消息发给 SDK，让模型从那里续写
   const finalMessages = prefill
     ? [...messages, { role: 'assistant' as const, content: prefill }]
@@ -258,13 +348,28 @@ async function streamWith(
     },
     wrappedChunk
   )
-  // 流结束还没解析出头（理论上不应发生）→ 走兜底：当 chat + none，最安全
-  if (!metaFired && onMeta) {
-    onMeta({ intent: 'chat', ask: 'none' })
+
+  // 探测阶段结束时 stream 已经 close 但 headBuffer 可能还没攒够 HEAD_PROBE_CHARS：
+  // 用模型最终全文做一次兜底决策（<24 字的情况极罕见，主要是 maxTokens=1 那种边角）。
+  if (prefillInjected === 'pending') {
+    headBuffer = text
+    flushHead()
   }
-  // 最终 text 也要拼上 prefill（上面 wrappedChunk 只拼了流到前端的增量）
+  // 流到末尾仍然攒不到探测字符（基本不可能，但兜底一下）→ 视为模型没理会 prefill
+  if (prefillInjected === 'pending') prefillInjected = 'no'
+
+  // meta 没在流中解析出来 → 走 inferMetaFromBody 按正文结构判定
+  // （之前这里硬塞 { intent: 'chat' }，会把"模型跳协议头直写文档"的整篇输出降级成聊天，
+  //  2026-08-20 日志 reqId=mt17sv4fr0g8r6m3 就是这个 bug）
+  if (!metaFired && onMeta) {
+    onMeta(inferMetaFromBody(rawBuffer))
+  }
+
+  // 返回给调用方的完整 text：与流到前端的拼接策略保持一致
+  const stitchPrefill = prefillInjected === 'yes'
+  const finalText = stitchPrefill && prefill ? prefill + text : text
   return {
-    text: prefill ? prefill + text : text,
+    text: finalText,
     tokens,
     cacheRead,
     cacheWrite

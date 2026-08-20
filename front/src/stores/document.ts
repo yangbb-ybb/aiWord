@@ -110,6 +110,45 @@ function stripProtocolInline(text: string): string {
 }
 
 /**
+ * 把 AI 输出"修干净"再喂回 history / 写入文档。
+ *
+ * 动机：今天 (2026-08-20) 看到的污染样例
+ *   - 模型有时会在 [CONTENT] 后先说一句元评论（如 "以下是删除日期后的完整文档："），
+ *     再用 ```markdown ... ``` 围栏包住真正的文档
+ *   - 这段元评论 + 围栏进了 chatHistory → 下一轮模型看到先例，照抄，跳过协议头
+ *   - 也直接进了 doc.content（如果用户接受 edit），文档头部就多一句废话
+ *
+ * 三层清理（保留最里层 ```markdown``` 围栏里的内容作为最终输出）：
+ *   1. 去协议标记（防御性，正常已经由后端剥离）
+ *   2. 去掉包裹文档的 ```markdown/md``` 围栏，只留围栏内文
+ *   3. 去掉紧贴 [CONTENT] 后、"以下是…/下面给出…/完整文档如下" 之类的引导句
+ */
+const FENCED_DOC_RE = /```(?:markdown|md)?\s*\n([\s\S]*?)```/i
+// 中文常见"自报家门"开头：以冒号 / 句号结尾，且包含"文档/文章/正文/版本/如下/以下"等关键词
+const LEADIN_META_RE =
+  /^\s*(?:[\s\S]{0,40}?(?:完整文档|完整文章|完整正文|文档如下|文章如下|更新后|修改后|调整后|以下是|以下为|下面为|下面给|下面是|修改如下|更新如下)\s*[：:]?)\s*\n+/i
+
+function sanitizeAiBody(text: string): string {
+  let body = stripProtocolInline(text).trimStart()
+  // 1) 优先尝试剥掉围栏，只留围栏内文（这是模型给"完整新文档"时的标准形态）
+  const fenced = body.match(FENCED_DOC_RE)
+  if (fenced) {
+    return fenced[1].trim()
+  }
+  // 2) 没有围栏但开头是元评论引导句 → 丢掉第一行（保留后续真实正文）
+  // 严格点：只有在引导句之后还有实质内容（>= 200 字 / 含 markdown 标题）才动，
+  // 否则可能就是普通的短回复，保留原样
+  const leadin = body.match(LEADIN_META_RE)
+  if (leadin) {
+    const after = body.slice(leadin[0].length).trimStart()
+    const afterHasDoc =
+      after.length >= 200 || /^#{1,6}\s/m.test(after)
+    if (afterHasDoc) return after
+  }
+  return body
+}
+
+/**
  * 一条"可点击选项"：AI 用 markdown 列表输出"**路径 X**：描述"，
  * 前端解析后渲染成按钮，点击即可一键续聊。
  */
@@ -857,7 +896,9 @@ export const useDocumentStore = defineStore('document', () => {
         clearTimeout(pendingDiffTimer)
         pendingDiffTimer = null
       }
-      const cleaned = stripProtocolInline(contentBuffer)
+      // 同步去协议头 / 围栏 / 引导句：保证 pendingDiff.postContent 干净，
+      // 后续 acceptPendingDiff → updateContent 写回文档时不会带"以下是..."等元评论
+      const cleaned = sanitizeAiBody(contentBuffer)
       const diffParts = diffLines(baseContent, cleaned)
       pendingDiffRevision.value++
       pendingDiff.value = {
@@ -945,7 +986,7 @@ export const useDocumentStore = defineStore('document', () => {
       )
 
       const finalMode: AiIntent = detected ?? 'chat' // AI 没出协议 → 当 chat（最安全，不动文档）
-      const cleanedContent = stripProtocolInline(contentBuffer)
+      const cleanedContent = sanitizeAiBody(contentBuffer)
 
       // AI 完全没出协议头时（罕见），走 fallbackHeader 智能判断 ask
       if (detected === null) {
