@@ -7,6 +7,7 @@ import {
   runTranslate
 } from '~/services/ai'
 import { resolveApiKey } from '~/providers'
+import { env } from '~/config/env'
 
 const generateBody = z.object({
   prompt: z.string().default(''),
@@ -135,6 +136,8 @@ async function streamAi(
       cacheRead: result.cacheRead ?? 0,
       cacheWrite: result.cacheWrite ?? 0
     })
+    // 默认把 AI 完整回复原文写进日志（最长 ~16k 字符），方便本地调试和回溯。
+    // 想关掉就在 end/.env 里设 LOG_AI_OUTPUT=false —— output 字段就不会出现在日志里。
     req.log.info(
       {
         aiEvent: event,
@@ -143,7 +146,8 @@ async function streamAi(
         cacheWrite: result.cacheWrite ?? 0,
         chunks: chunkCount,
         outputChars: result.text.length,
-        durationMs: Date.now() - start
+        durationMs: Date.now() - start,
+        ...(env.LOG_AI_OUTPUT ? { output: result.text } : {})
       },
       `ai ${event} done`
     )

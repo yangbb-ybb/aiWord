@@ -52,6 +52,12 @@ const schema = z.object({
   LOG_TO_CONSOLE: z
     .enum(['true', 'false'])
     .default('true')
+    .transform((v) => v === 'true'),
+  // 是否把 AI 的完整回复原文（最长 ~4096 tokens = ~16k 字符）写到日志文件
+  // 默认 true，方便本地调试和回溯生成内容；线上想关就 LOG_AI_OUTPUT=false
+  LOG_AI_OUTPUT: z
+    .enum(['true', 'false'])
+    .default('true')
     .transform((v) => v === 'true')
 })
 
