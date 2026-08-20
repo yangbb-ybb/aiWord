@@ -118,11 +118,25 @@ export type StreamMeta = {
   ask: 'none' | 'choice' | 'confirm'
 }
 
-/** 三行结构：[INTENT:xxx]\n[ASK:xxx]\n[CONTENT]（后接正文） */
+/**
+ * 三行结构：[INTENT:xxx]\n[ASK:xxx]\n[CONTENT]（后接正文）。
+ *
+ * ⚠️ 关键：不加 `^\s*` 锚 —— prefill 注入后模型可能"无视" prefill、完整重写协议头，
+ * rawBuffer 会变成 `[INTENT:[INTENT:edit]\n[ASK:none]\n[CONTENT]`，锚定版本匹配不上。
+ * 非锚定版本在 rawBuffer 任意位置找完整的 `[INTENT:xxx]\n[ASK:xxx]\n[CONTENT]` 子串，
+ * 覆盖"模型尊重 prefill"和"模型重生成协议头"两种情况。
+ *
+ * 老正则要求 [CONTENT] 后必须有换行，但流式 chunk 切分时 [CONTENT] 后可能正好没有 \n，
+ * 导致 rawBuffer 卡在 [..., [CONTENT]] 不匹配。放宽为 [CONTENT] 后任意字符即可。
+ */
 const PROTOCOL_HEADER_RE =
-  /^\s*\[INTENT:(edit|analyze|chat)\]\s*\n+\s*\[ASK:(none|choice|confirm)\]\s*\n+\s*\[CONTENT\]/i
-/** 老格式兜底：只识别第一行 [INTENT] */
-const INTENT_ONLY_RE = /^\s*\[INTENT:(edit|analyze|chat)\]\s*/i
+  /\s*\[INTENT:(edit|analyze|chat)\]\s*\n+\s*\[ASK:(none|choice|confirm)\]\s*\n+\s*\[CONTENT\]/i
+/**
+ * 兜底：只识别第一行 [INTENT]，没写 [ASK] 的视为 [ASK:none]（不弹窗）。
+ * ⚠️ 同样去掉 `^\s*` 锚，否则模型重生成协议头时（rawBuffer 第一行变成 `[INTENT:[` 而非完整标签），
+ * 这个兜底也匹配不上，会一路 fall through 到 ai.ts:streamWith 的"流结束兜底 chat"分支。
+ */
+const INTENT_ONLY_RE = /\s*\[INTENT:(edit|analyze|chat)\]/i
 
 /**
  * 尝试从累积文本里解析头部声明。命中 → { intent, ask, body }；没命中 → null。
@@ -164,7 +178,11 @@ async function streamWith(
   prefill?: string
 ) {
   const provider = getProvider()
-  // 累积 buffer：chunked 传输里协议头可能被切成多片，必须攒齐才能匹配
+  // 累积 buffer：chunked 传输里协议头可能被切成多片，必须攒齐才能匹配。
+  // 关键！rawBuffer 必须**始终包含注入的 prefill**，这样无论模型是否自己重新输出
+  // 协议头（实测 minimax/Anthropic 经常忽略 prefill、完整输出 [INTENT:[INTENT:edit]...），
+  // 我们都至少能匹配到完整的 `[INTENT:edit]\n[ASK:xxx]\n[CONTENT]` 子串。
+  // rawBuffer 累积完成后靠 parseStreamMeta 的非锚定正则兜底匹配（去掉 ^\s*）。
   let rawBuffer = ''
   let metaFired = false
   const handleDelta = (delta: string) => {

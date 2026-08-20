@@ -87,67 +87,26 @@ export interface ChatMessage {
  */
 export type AiIntent = 'edit' | 'analyze' | 'chat'
 
-const INTENT_RE = /^\s*\[INTENT:(edit|analyze|chat)\]\s*/i
 /**
- * 新版结构化协议：AI 头部必须依次输出三行
- *   行1: [INTENT:edit|analyze|chat]
- *   行2: [ASK:none|choice|confirm]
- *   行3: [CONTENT]
- * 然后才是正文。
+ * AI 的"是否在等用户做选择"信号，由后端 SSE `meta` 事件结构化下发。
+ * - choice → 前端弹选项弹窗（唯一权威信号）
+ * - confirm → 前端只 toast
+ * - none → 不弹窗
  *
- * 这个正则"一次性"匹配前 3 行协议头。兼容老格式（只写第一行）—— 缺 ASK 视为 'none'。
+ * ⚠️ 不再从前端正则从 chunk 文本里挖 [ASK:xxx]：协议头会被 Anthropic 按 token 切成多片
+ * （实测 [INTENT:edit]\n[ASK:none]\n[CONTENT] 会切成 9 个 chunk），单 chunk 永远拼不齐。
+ * 唯一可靠的来源是后端解析完整个头部后用 SSE `meta` 事件一次性下发，前端只信它。
  */
-// 老正则要求 [CONTENT] 后必须有换行，但流式 chunk 切分时 [CONTENT] 后可能正好没有 \n，
-// 导致 rawBuffer 卡在 [..., [CONTENT]] 不匹配。放宽为 [CONTENT] 后任意字符即可。
-const PROTOCOL_HEADER_RE =
-  /^\s*\[INTENT:(edit|analyze|chat)\]\s*\n+\s*\[ASK:(none|choice|confirm)\]\s*\n+\s*\[CONTENT\]/i
-/**
- * 兜底：只识别第一行 [INTENT]，没写 [ASK] 的视为 [ASK:none]（不弹窗）。
- */
-const INTENT_ONLY_RE = /^\s*\[INTENT:(edit|analyze|chat)\]\s*/i
+export type AiAsk = 'none' | 'choice' | 'confirm'
+
 /**
  * 正文中残留的协议标记清理：万一 AI 把 [INTENT:xxx] / [ASK:xxx] / [CONTENT] 当字符串写进正文。
+ * （防御性，正常情况下后端 parseStreamMeta 已剥离）
  */
 const PROTOCOL_INLINE_RE =
   /\s*\[(?:INTENT|ASK|CONTENT)(?::[^\]]*)?\]\s*/gi
 function stripProtocolInline(text: string): string {
   return text.replace(PROTOCOL_INLINE_RE, '')
-}
-
-/**
- * AI 的"是否在等用户做选择"信号，由结构化协议 [ASK:xxx] 决定。
- * - choice → 前端弹选项弹窗（唯一权威信号）
- * - confirm → 前端只 toast
- * - none → 不弹窗
- */
-export type AiAsk = 'none' | 'choice' | 'confirm'
-
-/**
- * 从 AI 流式累积的原始文本里解析协议头。
- * - 命中三行结构 → 返回 intent + ask + 去掉头部后的正文
- * - 只命中第一行（老格式）→ ask 兜底为 'none'
- * - 都没命中 → 返回 null（调用方走"老兜底逻辑"）
- */
-export function parseProtocolHeader(
-  raw: string
-): { intent: AiIntent; ask: AiAsk; body: string } | null {
-  const m3 = raw.match(PROTOCOL_HEADER_RE)
-  if (m3) {
-    return {
-      intent: m3[1].toLowerCase() as AiIntent,
-      ask: m3[2].toLowerCase() as AiAsk,
-      body: raw.slice(m3[0].length)
-    }
-  }
-  const m1 = raw.match(INTENT_ONLY_RE)
-  if (m1) {
-    return {
-      intent: m1[1].toLowerCase() as AiIntent,
-      ask: 'none', // 老格式：没 ASK 就当 none，不弹窗
-      body: raw.slice(m1[0].length)
-    }
-  }
-  return null
 }
 
 /**
@@ -774,24 +733,21 @@ export const useDocumentStore = defineStore('document', () => {
     let rawBuffer = ''
     let contentBuffer = ''
     let detected: AiIntent | null = opts.forceMode ?? null
-    // AI 自己声明的"是否在等用户做选择"，由结构化协议 [ASK:xxx] 决定
+    // AI 自己声明的"是否在等用户做选择"，由后端 SSE `meta` 事件结构化下发
     let detectedAsk: AiAsk = 'none'
-    // 等到足够 chunk 才用 regex 兜底判断 intent；meta 事件不受此限制（后端权威信号）
-    // 协议头可能被切成多片（如 `[INTENT:[` / `edit]\n[ASK:...`），单个 chunk 看不准，
-    // 必须累积几个 chunk 拼出完整 `[INTENT:xxx]\n[ASK:xxx]\n[CONTENT]` 才信。
-    const MIN_CHUNKS_BEFORE_REGEX_FALLBACK = 3
-    let chunkCount = 0
 
     // streamingPreview 的角色变化：
     // - chat/analyze 模式 → 右栏用它判断"AI 正在打字"（isChatStreaming）
     // - edit 模式 → 不维护（让中央 diff 视图独占，实时刷新）
     //
-    // 重要：detected 还没确定时**不创建** streamingPreview，UI 保持静默。
-    // 之前默认 mode='chat' 的写法会导致右栏立刻冒气泡、后端 meta 一来又得切走，
-    // 极端情况下 meta 丢了整条流都会被误判成 chat（你截图就是这个 bug）。
-    //
-    // - forceMode 已设 → 用户明确表态，立刻按 forceMode 建 streamingPreview
-    // - forceMode 未设 → 等 meta 事件 或 累积够 chunk 走 regex 兜底，再建
+    // ⚠️ detected 还没确定时**不创建** streamingPreview，UI 保持静默。
+    // 唯一决定 detected 的路径：
+    //   1) forceMode（用户在前端下拉/按钮明确表态） → 立刻按 forceMode
+    //   2) 后端 SSE `meta` 事件（权威信号） → 来了就立刻切
+    // 不再做正则兜底：协议头会被 Anthropic 按 token 切成多片（实测 `[INTENT:edit]\n[ASK:none]\n[CONTENT]`
+    // 会切成 9 个 chunk），单 chunk 看不准，攒几个也拼不出完整三行结构，
+    // 反而会在 meta 到达前把 intent 误判成 chat 渲染出来（用户截图就是这个 bug）。
+    // 用户偏好："宁愿慢点等后端 meta，也比判错类型好"。
     streamingPreview.value =
       detected === 'edit'
         ? null
@@ -805,42 +761,6 @@ export const useDocumentStore = defineStore('document', () => {
               prompt: opts.prompt ?? ''
             }
           : null
-
-    /**
-     * 从累积的原始文本里解析协议头（新版三行结构 + 旧版单行兼容）。
-     * 命中 → 返回 intent + ask + 去掉头部后的正文
-     * 没命中 → 返回 null（让流式继续累积，不切换 UI）
-     */
-    function tryParseHeader(text: string) {
-      // 先试三行结构（新版）
-      const m3 = text.match(PROTOCOL_HEADER_RE)
-      if (m3) {
-        return {
-          intent: m3[1].toLowerCase() as AiIntent,
-          ask: m3[2].toLowerCase() as AiAsk,
-          body: text.slice(m3[0].length)
-        }
-      }
-      // 兜底：只识别第一行 [INTENT]（旧版 / AI 没学会新协议）
-      const m1 = text.match(INTENT_ONLY_RE)
-      if (m1) {
-        return {
-          intent: m1[1].toLowerCase() as AiIntent,
-          ask: 'none' as AiAsk, // 旧格式：没 ASK 就当 none，不弹窗
-          body: text.slice(m1[0].length)
-        }
-      }
-      return null
-    }
-
-    /**
-     * 是否已经攒够 chunk 可以走 regex 兜底。
-     * - meta 事件不受此限制（后端权威信号，到了就用）
-     * - regex 必须等够 chunk 才信，因为协议头会被切成多片
-     */
-    function canUseRegexFallback() {
-      return chunkCount >= MIN_CHUNKS_BEFORE_REGEX_FALLBACK
-    }
 
     /**
      * 兜底：AI 完全没按协议输出时（罕见，理论上不应发生）。
@@ -866,7 +786,7 @@ export const useDocumentStore = defineStore('document', () => {
     // 这样右栏气泡打字过程就不会把协议头当成正文渲染出来。
     //
     // detected 仍为 null 时：不创建 streamingPreview（之前 `?? 'chat'` 默认建为 chat 是 bug）。
-    // UI 静默等待后端 meta 事件或 regex 兜底确认意图。
+    // UI 静默等待后端 SSE `meta` 事件（onMeta）确认意图。
     function pushPreview() {
       if (detected === 'edit') {
         streamingPreview.value = null
@@ -978,33 +898,22 @@ export const useDocumentStore = defineStore('document', () => {
           history
         },
         {
-          // 每个流式 chunk 进来——但**先攒几个再分流**，避免在半个协议头上判断错
+          // 每个流式 chunk 进来：纯累积，不做 intent 判断。
+          // intent 只由 onMeta（后端权威）或 forceMode 决定。
           onDelta(delta) {
             rawBuffer += delta
             // 无条件 append：保证右栏气泡逐字打字，无论 detected 是 null 还是已设
             // 协议头会被 pushPreview 里的 stripProtocolInline 抹掉，不会泄漏给用户
             contentBuffer += delta
-            chunkCount++
-            if (detected === null) {
-              // 优先信后端 meta 事件（onMeta 路径会立刻设 detected）
-              // 这里只是 regex 兜底：必须攒够 chunk 才信
-              if (canUseRegexFallback()) {
-                const parsed = tryParseHeader(rawBuffer)
-                if (parsed) {
-                  detected = parsed.intent
-                  detectedAsk = parsed.ask
-                }
-              }
-              if (detected === 'edit') {
-                schedulePushPendingDiff() // edit 模式：立刻初始化 diff
-              }
-            } else if (detected === 'edit') {
-              schedulePushPendingDiff() // edit 模式：实时刷新 diff
+            // 已确定是 edit 模式 → 实时刷 diff；chat/analyze 模式不动；
+            // detected === null 时也不动（等 onMeta 决定）
+            if (detected === 'edit') {
+              schedulePushPendingDiff()
             }
-            pushPreview() // chat/analyze 模式：实时更新 streamingPreview；edit 模式这里被首行 if 拦住置 null
+            pushPreview() // detected===null 时静默；chat/analyze 时更新 streamingPreview；edit 时清空
           },
-          // 后端结构化 meta 事件：拿到就立刻分流（**权威信号**）
-          // 如果 stream 里没收到 meta（兼容老后端），onDelta 里的正则兜底
+          // 后端 SSE `meta` 事件：解析完协议头后第一时间下发，**唯一权威信号**
+          // 拿到就立刻分流，不再做任何正则兜底
           onMeta(meta) {
             if (detected !== null) return // 已经切过了，不重复
             detected = meta.intent
