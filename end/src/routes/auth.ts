@@ -210,6 +210,7 @@ export default async function authRoutes(app: FastifyInstance) {
       const { user, accessToken, refreshToken } = await rotateRefreshToken(
         body.refreshToken
       )
+      req.log.info({ event: 'refresh_success', userId: user.id }, 'token rotated')
       return {
         user: toPublic(user),
         accessToken,
@@ -217,6 +218,14 @@ export default async function authRoutes(app: FastifyInstance) {
       }
     } catch (err) {
       const e = err as ReturnType<typeof authError>
+      req.log.warn(
+        {
+          event: 'refresh_failed',
+          errorCode: e.code ?? 'REFRESH_INVALID',
+          reason: e.message ?? 'unknown'
+        },
+        'refresh failed — client will be kicked to login'
+      )
       return reply.code(e.statusCode ?? 401).send({
         code: e.statusCode ?? 401,
         errorCode: e.code ?? 'REFRESH_INVALID',

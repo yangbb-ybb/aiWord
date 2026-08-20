@@ -116,11 +116,109 @@ export function setUnauthorizedHandler(fn: UnauthorizedHandler | null) {
  * 并发去重：多个请求同时 401 时只发一次 /api/auth/refresh。
  * 后端 rotateRefreshToken 会撤销旧 refresh token 并签发新的（rotation 机制），
  * 所以并发 N 次 refresh 会让 N-1 次拿到 REFRESH_REVOKED —— 必须串行。
+ *
+ * ⚠️ 单 tab 内 `refreshing` 已经够了，但**多 tab 同时 refresh** 会绕过这个 singleton：
+ *   - Tab A 看到 401，调 refresh，rotation 撤销旧 token、签发新 token
+ *   - Tab B 也看到 401，**它不知道 Tab A 在 refresh**，自己再调一次
+ *   - Tab B 拿到 REFRESH_REVOKED → clearTokens → 跳 /login
+ *
+ * 修法：用 BroadcastChannel 跨 tab 协调。
+ *   - 当前 tab 发起 refresh：postMessage('refresh:start', id) 并开始干活
+ *   - 其他 tab 收到 'refresh:start'：订阅 'refresh:done' / 'refresh:failed'，等结果
+ *   - 当前 tab 干完：postMessage('refresh:done', id, tokens) 或 'refresh:failed', id
+ *   - 其他 tab 拿到 done：从消息里直接拿 tokens（不用再发请求）→ localStorage 已同步写入
  */
+const REFRESH_CHANNEL = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('aiword-auth-refresh') : null
+
+type RefreshMsg =
+  | { type: 'refresh:start'; id: string }
+  | { type: 'refresh:done'; id: string; tokens: { accessToken: string; refreshToken: string } }
+  | { type: 'refresh:failed'; id: string }
+
 let refreshing: Promise<{ accessToken: string; refreshToken: string }> | null = null
 
+/** 跨 tab 协调：当前 tab 拿到 401 时，先广播看有没有别人已经在 refresh。 */
+async function waitForOtherTabRefresh(id: string): Promise<{ accessToken: string; refreshToken: string } | null> {
+  if (!REFRESH_CHANNEL) return null
+  return new Promise((resolve) => {
+    const handler = (e: MessageEvent<RefreshMsg>) => {
+      const msg = e.data
+      if (msg.type === 'refresh:done' && msg.id === id) {
+        REFRESH_CHANNEL.removeEventListener('message', handler)
+        resolve(msg.tokens)
+      } else if (msg.type === 'refresh:failed' && msg.id === id) {
+        REFRESH_CHANNEL.removeEventListener('message', handler)
+        resolve(null)
+      }
+    }
+    REFRESH_CHANNEL!.addEventListener('message', handler)
+    // 1.5s 后还没收到结果，说明没别的 tab 在 refresh（或者别的 tab 也死了），
+    // 自己接管。超过这个时间还没动静的情况：所有 tab 都没启动 refresh → 当前 tab 来做。
+    setTimeout(() => {
+      REFRESH_CHANNEL!.removeEventListener('message', handler)
+      resolve(null)
+    }, 1500)
+  })
+}
+
+/**
+ * 公开：触发一次 token 轮换。SSE（fetch）端点不走 axios 拦截器，
+ * 收到 401 时需要主动调用本函数拿到新 token 再 retry fetch。
+ *
+ * - 同 tab 内并发去重 + 跨 tab BroadcastChannel 协调（见上方注释）
+ * - 成功：localStorage 已写入新 token，返回 { accessToken, refreshToken }
+ * - 失败：localStorage 已清空，触发 onUnauthorized，抛 ApiError
+ */
+export async function refreshTokens(): Promise<{ accessToken: string; refreshToken: string }> {
+  return doRefresh()
+}
+
+/**
+ * 解析 JWT payload 里的 exp 字段（秒 → 毫秒）。失败返回 null。
+ *
+ * JWT 是 `header.payload.signature`，payload 是 base64url 编码的 JSON。
+ * 不验证签名 —— 这里只读 exp，不做信任决策（最终所有受保护接口都会再被后端校验）。
+ */
+function decodeJwtExp(token: string): number | null {
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 3) return null
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4)
+    const json = atob(padded)
+    const obj = JSON.parse(json) as { exp?: number }
+    return typeof obj.exp === 'number' ? obj.exp * 1000 : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 主动 preflight：如果当前 access token 距过期 < threshold（默认 5 分钟），
+ * 就提前 refresh。用户连续写 2+ 小时时，永远不会撞上 401 + retry 那一瞬间的延迟。
+ *
+ * ⚠️ refresh 失败时不抛 —— 让原请求继续走，最后由 axios 拦截器或 fetch 的 401 路径兜底。
+ * 否则 preflight 自己抛会破坏所有业务请求的正常错误流。
+ */
+const PREFLIGHT_REFRESH_THRESHOLD_MS = 5 * 60 * 1000
+export async function ensureFreshToken(): Promise<void> {
+  const token = getAccessToken()
+  if (!token) return
+  const exp = decodeJwtExp(token)
+  if (exp == null) return
+  if (exp - Date.now() > PREFLIGHT_REFRESH_THRESHOLD_MS) return
+  // 距过期 < 5 分钟 → 主动 refresh
+  try {
+    await refreshTokens()
+  } catch {
+    // 静默吞掉；后续 401 → refreshTokens() 的路径会再次尝试 + 触发 onUnauthorized
+  }
+}
+
 async function doRefresh(): Promise<{ accessToken: string; refreshToken: string }> {
+  // 0) 同 tab 内已经 in-flight → 直接复用（防止同 tab 多 401 并发触发出 N 次 refresh 请求）
   if (refreshing) return refreshing
+
   const rt = getRefreshToken()
   if (!rt) {
     const e = new ApiError(401, 401, 'NO_REFRESH_TOKEN', 'localStorage 里没有 refresh token')
@@ -128,24 +226,43 @@ async function doRefresh(): Promise<{ accessToken: string; refreshToken: string 
     if (onUnauthorized) onUnauthorized()
     throw e
   }
+
+  // 关键：把 refreshing 提前占位（singleton），后续同 tab 再有 401 都复用同一个 promise。
+  // 不能等到 peer wait 完再设 —— 否则 wait 期间同 tab 并发 401 会绕过 singleton，重复发 refresh。
+  const id = Math.random().toString(36).slice(2)
   refreshing = (async () => {
+    // 1) 跨 tab 协调：广播问一句"有没有人在 refresh"，等最多 1.5s
+    if (REFRESH_CHANNEL) REFRESH_CHANNEL.postMessage({ type: 'refresh:start', id } as RefreshMsg)
+    const peerResult = await waitForOtherTabRefresh(id)
+    if (peerResult) {
+      // 别的 tab 已经刷完了，tokens 已经在 localStorage 里
+      return peerResult
+    }
+
+    // 2) 当前 tab 自己刷新
     try {
       const data = await api.refresh<RefreshResponse>('/api/auth/refresh', {
         refreshToken: rt
       })
       setTokens(data.accessToken, data.refreshToken)
-      return { accessToken: data.accessToken, refreshToken: data.refreshToken }
+      const tokens = { accessToken: data.accessToken, refreshToken: data.refreshToken }
+      if (REFRESH_CHANNEL) REFRESH_CHANNEL.postMessage({ type: 'refresh:done', id, tokens } as RefreshMsg)
+      return tokens
     } catch (err) {
       // refresh 自身失败（含网络错误）—— 一律踢登录
       clearTokens()
       if (onUnauthorized) onUnauthorized()
+      if (REFRESH_CHANNEL) REFRESH_CHANNEL.postMessage({ type: 'refresh:failed', id } as RefreshMsg)
       throw err instanceof ApiError
         ? err
         : toApiError(err as AxiosError<BackendEnvelopeError>)
-    } finally {
-      refreshing = null
     }
   })()
+  // 不论成功失败都要清空 singleton，否则一次失败会导致后续所有 401 都拿到同一个 rejected promise
+  // —— 表现为"refresh 之后再也不能 refresh"，看起来 refresh token 完全失效。
+  refreshing.finally(() => {
+    refreshing = null
+  })
   return refreshing
 }
 
@@ -157,7 +274,11 @@ function createHttp(_opts: { on401Redirect?: boolean }): AxiosInstance {
     headers: { 'content-type': 'application/json' }
   })
 
-  inst.interceptors.request.use((config) => {
+  inst.interceptors.request.use(async (config) => {
+    // 主动 preflight：access 距过期 < 5 分钟就先 refresh 一次，
+    // 让用户连续写 2h+ 都不会撞上 401 → refresh → retry 的瞬间延迟。
+    // ensureFreshToken 内部自带跨 tab + 同 tab 去重，不会重复触发。
+    await ensureFreshToken()
     const token = getAccessToken()
     if (token) config.headers.Authorization = `Bearer ${token}`
     return config

@@ -9,7 +9,7 @@
  *    EventSource 也不行，它只支持 GET，不支持 POST body。
  *    所以这是项目里唯一允许直接调 fetch 的地方，其它业务代码必须走 ./api 的 axios 封装。
  */
-import { BASE_URL, getAccessToken, ApiError } from './api'
+import { BASE_URL, getAccessToken, ApiError, refreshTokens, ensureFreshToken } from './api'
 
 export { ApiError }
 
@@ -51,6 +51,8 @@ export async function postStream(
   body: unknown,
   handlers: StreamHandlers = {}
 ): Promise<string> {
+  // 主动 preflight：access 距过期 < 5 分钟就先 refresh，免得 SSE 长流撞上 401 中断。
+  await ensureFreshToken()
   const token = getAccessToken()
   const headers: Record<string, string> = {
     'content-type': 'application/json',
@@ -58,13 +60,33 @@ export async function postStream(
   }
   if (token) headers.authorization = `Bearer ${token}`
 
-  const res = await fetch(BASE_URL + path, {
+  let res = await fetch(BASE_URL + path, {
     method: 'POST',
     headers,
     body: JSON.stringify(body ?? {}),
     // 不让 axios/fetch 缓存
     cache: 'no-store'
   })
+
+  // SSE 端点不走 axios 拦截器，所以 access 过期时不会自动 refresh。
+  // 拿到 401 时手动触发一次 refresh（内部已含跨 tab 协调 + 同 tab 并发去重），
+  // 然后用新 token 重试一次 fetch。
+  if (res.status === 401) {
+    try {
+      const newTokens = await refreshTokens()
+      headers.authorization = `Bearer ${newTokens.accessToken}`
+      res = await fetch(BASE_URL + path, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body ?? {}),
+        cache: 'no-store'
+      })
+    } catch {
+      // refresh 失败 —— refreshTokens() 内部已经 clearTokens + onUnauthorized + throw 了，
+      // 这里直接抛 ApiError 让上层处理（前端会被踢到 /login）。
+      throw new ApiError(401, 401, 'REFRESH_FAILED', 'SSE 401 后 refresh 失败，请重新登录')
+    }
+  }
 
   if (!res.ok) {
     // 后端 SSE 在出错时会降级成普通 JSON（其实只有 5xx 才会进 errorHandler）。
