@@ -728,6 +728,24 @@ export const useDocumentStore = defineStore('document', () => {
     // 拿这篇文档专属的历史；没有就空
     const history = chatHistory.value.get(doc.id) ?? []
 
+    // 立即把 user 气泡塞进 chatThread —— 流式过程中右栏也要看到自己刚发的消息，
+    // 否则用户会以为没发出去。AI 气泡流结束后由 recordConversation / acceptPendingDiff 补上。
+    // edit 模式如果被 reject，rejectPendingDiff 会把这条 user 气泡回滚掉（保持"拒绝不留痕"语义）。
+    const userMsgId = `u-${Date.now()}`
+    {
+      const next = new Map(chatThread.value)
+      next.set(doc.id, [
+        ...(next.get(doc.id) ?? []),
+        {
+          id: userMsgId,
+          role: 'user',
+          content: opts.prompt ?? '',
+          ts: Date.now()
+        }
+      ])
+      chatThread.value = next
+    }
+
     // 流式缓冲：rawBuffer 是后端原始字节（含标签），
     // contentBuffer 是去掉 [INTENT:xxx] 后真正展示/处理的内容
     let rawBuffer = ''
@@ -858,12 +876,8 @@ export const useDocumentStore = defineStore('document', () => {
       kind: AiIntent,
       ask: AiAsk = 'none'
     ) {
-      const userMsg: ChatMessage = {
-        id: `u-${Date.now()}`,
-        role: 'user',
-        content: userPrompt,
-        ts: Date.now()
-      }
+      // user 气泡已由 generate() 开始时塞进 chatThread，这里只补 AI 气泡。
+      // chatHistory 仍然完整保留 user + assistant —— AI 需要这两条做上下文记忆。
       const aiMsg: ChatMessage = {
         id: `a-${Date.now() + 1}`,
         role: 'assistant',
@@ -873,7 +887,7 @@ export const useDocumentStore = defineStore('document', () => {
         ts: Date.now() + 1
       }
       const next = new Map(chatThread.value)
-      next.set(doc.id, [...(next.get(doc.id) ?? []), userMsg, aiMsg])
+      next.set(doc.id, [...(next.get(doc.id) ?? []), aiMsg])
       chatThread.value = next
 
       const histNext = new Map(chatHistory.value)
@@ -990,15 +1004,9 @@ export const useDocumentStore = defineStore('document', () => {
     histNext.set(pd.docId, histList.slice(-20))
     chatHistory.value = histNext
 
-    // chatThread：右栏展示，编辑消息渲染为"已修改 [+N -M]"而不是全文
+    // chatThread：右栏展示。user 气泡已由 generate() 开始时塞进去，这里只补 AI 气泡。
     const threadNext = new Map(chatThread.value)
     const threadList = [...(threadNext.get(pd.docId) ?? [])]
-    threadList.push({
-      id: `u-${Date.now()}`,
-      role: 'user',
-      content: pd.prompt,
-      ts: Date.now()
-    })
     threadList.push({
       id: `a-${Date.now()}`,
       role: 'assistant',
@@ -1022,8 +1030,24 @@ export const useDocumentStore = defineStore('document', () => {
    */
   function rejectPendingDiff(): boolean {
     if (!pendingDiff.value) return false
+    const pd = pendingDiff.value
     pendingDiff.value = null
     streamingPreview.value = null
+    // 回滚 generate() 开始时塞进 chatThread 的 user 气泡（保持"拒绝不留痕"语义）
+    // 只动 pd.docId 这条 doc 的 chatThread，避免误伤其他 doc
+    const thread = chatThread.value.get(pd.docId)
+    if (thread && thread.length > 0) {
+      const next = new Map(chatThread.value)
+      // 从末尾往前找最近的 user 气泡；正常情况就是最后一条
+      const idx = [...thread].reverse().findIndex((m) => m.role === 'user')
+      if (idx >= 0) {
+        const realIdx = thread.length - 1 - idx
+        const newList = thread.slice(0, realIdx)
+        if (newList.length === 0) next.delete(pd.docId)
+        else next.set(pd.docId, newList)
+        chatThread.value = next
+      }
+    }
     return true
   }
 
