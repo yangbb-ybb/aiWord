@@ -14,7 +14,13 @@
  * ⚠️ 不要直接写 axios(...) 或 fetch(...)。唯一例外是 ./stream.ts —— SSE 流式必须用 fetch + ReadableStream，axios 不支持。
  */
 
-import axios, { AxiosError, type AxiosInstance, type AxiosResponse } from 'axios'
+import axios, {
+  AxiosError,
+  AxiosHeaders,
+  type AxiosInstance,
+  type AxiosResponse,
+  type InternalAxiosRequestConfig
+} from 'axios'
 
 const BASE_URL =
   (import.meta.env.VITE_API_BASE_URL as string | undefined) ??
@@ -77,6 +83,16 @@ interface BackendEnvelopeError {
   details?: unknown
 }
 
+/** /api/auth/refresh 返回结构（和后端 AuthSuccess 对齐，user 字段本拦截器不用） */
+interface RefreshResponse {
+  user: unknown
+  accessToken: string
+  refreshToken: string
+}
+
+/** 给 config 挂一个 _retry 标记，防止 refresh 后重发还 401 时再次进入 refresh 分支 */
+type RetryableConfig = InternalAxiosRequestConfig & { _retry?: boolean }
+
 function toApiError(err: AxiosError<BackendEnvelopeError>): ApiError {
   const status = err.response?.status ?? 0
   const data = err.response?.data
@@ -96,6 +112,43 @@ export function setUnauthorizedHandler(fn: UnauthorizedHandler | null) {
   onUnauthorized = fn
 }
 
+/**
+ * 并发去重：多个请求同时 401 时只发一次 /api/auth/refresh。
+ * 后端 rotateRefreshToken 会撤销旧 refresh token 并签发新的（rotation 机制），
+ * 所以并发 N 次 refresh 会让 N-1 次拿到 REFRESH_REVOKED —— 必须串行。
+ */
+let refreshing: Promise<{ accessToken: string; refreshToken: string }> | null = null
+
+async function doRefresh(): Promise<{ accessToken: string; refreshToken: string }> {
+  if (refreshing) return refreshing
+  const rt = getRefreshToken()
+  if (!rt) {
+    const e = new ApiError(401, 401, 'NO_REFRESH_TOKEN', 'localStorage 里没有 refresh token')
+    clearTokens()
+    if (onUnauthorized) onUnauthorized()
+    throw e
+  }
+  refreshing = (async () => {
+    try {
+      const data = await api.refresh<RefreshResponse>('/api/auth/refresh', {
+        refreshToken: rt
+      })
+      setTokens(data.accessToken, data.refreshToken)
+      return { accessToken: data.accessToken, refreshToken: data.refreshToken }
+    } catch (err) {
+      // refresh 自身失败（含网络错误）—— 一律踢登录
+      clearTokens()
+      if (onUnauthorized) onUnauthorized()
+      throw err instanceof ApiError
+        ? err
+        : toApiError(err as AxiosError<BackendEnvelopeError>)
+    } finally {
+      refreshing = null
+    }
+  })()
+  return refreshing
+}
+
 /** 创建 axios 实例并统一错误处理 */
 function createHttp(_opts: { on401Redirect?: boolean }): AxiosInstance {
   const inst = axios.create({
@@ -112,13 +165,71 @@ function createHttp(_opts: { on401Redirect?: boolean }): AxiosInstance {
 
   inst.interceptors.response.use(
     (res) => res,
-    (err: AxiosError<BackendEnvelopeError>) => {
-      if (err.response?.status === 401) {
-        // 只清 token + 通知订阅者。不要在这里 location.href，会触发硬刷新导致旧请求堆积。
+    async (err: AxiosError<BackendEnvelopeError>) => {
+      const status = err.response?.status
+      const config = err.config as RetryableConfig | undefined
+      const url = config?.url ?? ''
+
+      // 1) 非 401：原样抛
+      if (status !== 401) {
+        throw toApiError(err)
+      }
+
+      // 2) refresh 端点自己 401 —— 不能再 refresh，否则死循环；直接踢
+      if (url.includes('/api/auth/refresh')) {
         clearTokens()
         if (onUnauthorized) onUnauthorized()
+        throw toApiError(err)
       }
-      throw toApiError(err)
+
+      // 3) 普通端点 401 但本地没 refresh token —— 没法续期，直接踢
+      if (!getRefreshToken()) {
+        clearTokens()
+        if (onUnauthorized) onUnauthorized()
+        throw toApiError(err)
+      }
+
+      // 4) 已经被 retry 过一次还 401 —— 兜底防死循环，直接踢
+      if (config?._retry) {
+        clearTokens()
+        if (onUnauthorized) onUnauthorized()
+        throw toApiError(err)
+      }
+
+      // 5) 走 refresh + retry
+      await doRefresh()
+
+      const newToken = getAccessToken()
+      if (!newToken || !config) {
+        // 极端：setTokens 没生效（不应该发生）—— 兜底踢出
+        clearTokens()
+        if (onUnauthorized) onUnauthorized()
+        throw toApiError(err)
+      }
+
+      // axios v1：headers 是 AxiosHeaders 实例，必须用 .set()，直接赋值会静默失败
+      if (
+        config.headers &&
+        typeof (config.headers as AxiosHeaders).set === 'function'
+      ) {
+        ;(config.headers as AxiosHeaders).set('Authorization', `Bearer ${newToken}`)
+      } else {
+        ;(config.headers as Record<string, string>).Authorization = `Bearer ${newToken}`
+      }
+      config._retry = true
+
+      try {
+        // 用同一实例的 request 触发完整链路（包含请求拦截器）
+        const retryRes = await inst.request(config)
+        // 关键：返回成功响应，业务代码看不到 401
+        return retryRes
+      } catch (retryErr) {
+        // 重发还 401 —— 极小概率（刚拿到的 token 立刻失效 / 路由级权限变更）。
+        // fail-closed：清 token + 踢登录，抛重试的错误更具诊断价值。
+        clearTokens()
+        if (onUnauthorized) onUnauthorized()
+        throw toApiError(retryErr as AxiosError<BackendEnvelopeError>)
+      }
     }
   )
 

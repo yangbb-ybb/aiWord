@@ -12,26 +12,10 @@ import usersRoutes from '~/routes/users'
 import exportRoutes from '~/routes/export'
 import { AppError, isDbError } from './services/errors'
 import { createLogger } from './utils/logger'
-import { now } from './utils/time'
-import path from 'node:path'
 
 export async function buildApp() {
   // 日志：按天写文件 + dev 同时打 console
   const logger = await createLogger()
-
-  // 启动 banner
-  const logDir = path.isAbsolute(env.LOG_DIR)
-    ? env.LOG_DIR
-    : path.resolve(process.cwd(), env.LOG_DIR)
-  logger.info(
-    {
-      nodeEnv: env.NODE_ENV,
-      logLevel: env.LOG_LEVEL,
-      logDir,
-      logFile: `${env.LOG_FILE}-${now().toISOString().slice(0, 10)}.log`
-    },
-    'logger initialized'
-  )
 
   // Fastify v4 的 FastifyLoggerOptions 不支持 base/timestamp/formatters，
   // 直接把 pino logger 实例当 logger 传进去（pino Logger 本身就是 FastifyBaseLogger）。

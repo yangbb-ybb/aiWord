@@ -776,27 +776,35 @@ export const useDocumentStore = defineStore('document', () => {
     let detected: AiIntent | null = opts.forceMode ?? null
     // AI 自己声明的"是否在等用户做选择"，由结构化协议 [ASK:xxx] 决定
     let detectedAsk: AiAsk = 'none'
+    // 等到足够 chunk 才用 regex 兜底判断 intent；meta 事件不受此限制（后端权威信号）
+    // 协议头可能被切成多片（如 `[INTENT:[` / `edit]\n[ASK:...`），单个 chunk 看不准，
+    // 必须累积几个 chunk 拼出完整 `[INTENT:xxx]\n[ASK:xxx]\n[CONTENT]` 才信。
+    const MIN_CHUNKS_BEFORE_REGEX_FALLBACK = 3
+    let chunkCount = 0
 
     // streamingPreview 的角色变化：
     // - chat/analyze 模式 → 右栏用它判断"AI 正在打字"（isChatStreaming）
     // - edit 模式 → 不维护（让中央 diff 视图独占，实时刷新）
-    // 这样后端流式回来时，前端**立刻**根据已检测到的 intent 分流，不用等流结束
     //
-    // mode 没识别前默认 'chat'（AI 99% 的非编辑指令都是聊天/分析）：
-    // - 让"一键生成"按下后立刻出现"AI 正在打字"的气泡，不需要等 meta 帧到达
-    // - 协议头/正文分片的剥离在 pushPreview 里做（用 stripProtocolInline）
-    // - meta 后续若带 intent='edit'，pushPreview 立刻把 streamingPreview 置 null 切走
+    // 重要：detected 还没确定时**不创建** streamingPreview，UI 保持静默。
+    // 之前默认 mode='chat' 的写法会导致右栏立刻冒气泡、后端 meta 一来又得切走，
+    // 极端情况下 meta 丢了整条流都会被误判成 chat（你截图就是这个 bug）。
+    //
+    // - forceMode 已设 → 用户明确表态，立刻按 forceMode 建 streamingPreview
+    // - forceMode 未设 → 等 meta 事件 或 累积够 chunk 走 regex 兜底，再建
     streamingPreview.value =
       detected === 'edit'
         ? null
-        : {
-            docId: doc.id,
-            preContent: baseContent,
-            accumulated: '',
-            rawBuffer: '',
-            mode: detected ?? 'chat',
-            prompt: opts.prompt ?? ''
-          }
+        : detected !== null
+          ? {
+              docId: doc.id,
+              preContent: baseContent,
+              accumulated: '',
+              rawBuffer: '',
+              mode: detected,
+              prompt: opts.prompt ?? ''
+            }
+          : null
 
     /**
      * 从累积的原始文本里解析协议头（新版三行结构 + 旧版单行兼容）。
@@ -826,6 +834,15 @@ export const useDocumentStore = defineStore('document', () => {
     }
 
     /**
+     * 是否已经攒够 chunk 可以走 regex 兜底。
+     * - meta 事件不受此限制（后端权威信号，到了就用）
+     * - regex 必须等够 chunk 才信，因为协议头会被切成多片
+     */
+    function canUseRegexFallback() {
+      return chunkCount >= MIN_CHUNKS_BEFORE_REGEX_FALLBACK
+    }
+
+    /**
      * 兜底：AI 完全没按协议输出时（罕见，理论上不应发生）。
      * 新协议里 AI 必须输出 [INTENT]，所以这里直接当作 chat + none（最安全）。
      */
@@ -847,17 +864,36 @@ export const useDocumentStore = defineStore('document', () => {
     // edit 模式不维护 streamingPreview——让中央 diff 视图独占
     // 关键：accumulated 写入前用 stripProtocolInline 把 [INTENT:xxx]/[ASK:xxx]/[CONTENT] 抹掉，
     // 这样右栏气泡打字过程就不会把协议头当成正文渲染出来。
+    //
+    // detected 仍为 null 时：不创建 streamingPreview（之前 `?? 'chat'` 默认建为 chat 是 bug）。
+    // UI 静默等待后端 meta 事件或 regex 兜底确认意图。
     function pushPreview() {
       if (detected === 'edit') {
         streamingPreview.value = null
         return
       }
-      if (!streamingPreview.value) return
+      // AI 还没表态 → 不创建也不更新 streamingPreview，UI 静默
+      if (detected === null) {
+        return
+      }
+      // 首次创建（之前 null 现在有 detected 了）
+      if (!streamingPreview.value) {
+        streamingPreview.value = {
+          docId: doc.id,
+          preContent: baseContent,
+          accumulated: stripProtocolInline(contentBuffer),
+          rawBuffer,
+          mode: detected,
+          prompt: opts.prompt ?? ''
+        }
+        return
+      }
+      // 已有 preview，正常增量更新
       streamingPreview.value = {
         ...streamingPreview.value,
         accumulated: stripProtocolInline(contentBuffer),
         rawBuffer,
-        mode: detected ?? 'chat'
+        mode: detected
       }
     }
 
@@ -942,20 +978,22 @@ export const useDocumentStore = defineStore('document', () => {
           history
         },
         {
-          // 每个流式 chunk 进来——立刻分流，**不等流结束**
+          // 每个流式 chunk 进来——但**先攒几个再分流**，避免在半个协议头上判断错
           onDelta(delta) {
             rawBuffer += delta
             // 无条件 append：保证右栏气泡逐字打字，无论 detected 是 null 还是已设
             // 协议头会被 pushPreview 里的 stripProtocolInline 抹掉，不会泄漏给用户
             contentBuffer += delta
+            chunkCount++
             if (detected === null) {
-              // 还在等头部协议。优先信后端 meta 事件；如果没收到，再退回到本地正则解析
-              // - 后端 meta 事件走 onMeta 路径会立刻设 detected
-              // - 这里再兜一层，确保即使后端没发出 meta，也能从 rawBuffer 切出来
-              const parsed = tryParseHeader(rawBuffer)
-              if (parsed) {
-                detected = parsed.intent
-                detectedAsk = parsed.ask
+              // 优先信后端 meta 事件（onMeta 路径会立刻设 detected）
+              // 这里只是 regex 兜底：必须攒够 chunk 才信
+              if (canUseRegexFallback()) {
+                const parsed = tryParseHeader(rawBuffer)
+                if (parsed) {
+                  detected = parsed.intent
+                  detectedAsk = parsed.ask
+                }
               }
               if (detected === 'edit') {
                 schedulePushPendingDiff() // edit 模式：立刻初始化 diff
