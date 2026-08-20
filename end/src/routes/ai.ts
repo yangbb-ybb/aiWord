@@ -81,7 +81,10 @@ function ensureAiAvailable(req: any, reply: any): boolean {
  * meta 事件承载 AI 头部声明 [INTENT]/[ASK]/[CONTENT] 的结构化字段（一旦拿到就立刻发），
  * 这样前端不需要靠正则从文本里挖协议位，能直接拿到干净的 { intent, ask }。
  *
- * runner 是 (onChunk, onMeta) => Promise<{text, tokens}>；这里再套一层日志和计时。
+ * done 事件附带 cacheRead/cacheWrite：来自 Anthropic prompt cache 命中/写入 tokens，
+ * 前端可在 UI 上展示"本次命中 cache X tokens"，让用户感知 prompt caching 的省钱效果。
+ *
+ * runner 是 (onChunk, onMeta) => Promise<{text, tokens, cacheRead?, cacheWrite?}>；这里再套一层日志和计时。
  */
 async function streamAi(
   req: any,
@@ -90,7 +93,7 @@ async function streamAi(
   runner: (
     onChunk: (delta: string) => void,
     onMeta: (meta: { intent: 'edit' | 'analyze' | 'chat'; ask: 'none' | 'choice' | 'confirm' }) => void
-  ) => Promise<{ text: string; tokens?: number }>
+  ) => Promise<{ text: string; tokens?: number; cacheRead?: number; cacheWrite?: number }>
 ) {
   // reply.raw.write() 会绕过 @fastify/cors 的 reply.send 自动注入，
   // 所以这里手动把 CORS 头带上，否则浏览器会判定跨域失败、看不到任何 chunk。
@@ -126,11 +129,18 @@ async function streamAi(
         send('meta', meta)
       }
     )
-    send('done', { text: result.text, tokens: result.tokens })
+    send('done', {
+      text: result.text,
+      tokens: result.tokens,
+      cacheRead: result.cacheRead ?? 0,
+      cacheWrite: result.cacheWrite ?? 0
+    })
     req.log.info(
       {
         aiEvent: event,
         tokens: result.tokens ?? 0,
+        cacheRead: result.cacheRead ?? 0,
+        cacheWrite: result.cacheWrite ?? 0,
         chunks: chunkCount,
         outputChars: result.text.length,
         durationMs: Date.now() - start

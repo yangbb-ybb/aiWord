@@ -23,6 +23,10 @@ export interface StreamMetaEvent {
 export interface StreamDoneEvent {
   text: string
   tokens?: number
+  /** Anthropic prompt cache 命中读取的 tokens（按 10% 价计费） */
+  cacheRead?: number
+  /** 本次请求新写入 cache 的 tokens */
+  cacheWrite?: number
 }
 export interface StreamErrorEvent {
   message: string

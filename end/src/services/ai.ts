@@ -74,38 +74,25 @@ function buildSystem(opts: {
   const length = lengthToText(opts.length ?? 50)
   const lang = LANG_DESC[opts.language ?? 'zh']
   return [
-    '⚠️ 你的每一次回复都必须以这三行开头，紧挨着，不能有任何前缀/寒暄/emoji/围栏/解释：',
+    '你的回复必须以这三行开头，紧挨着，不要前缀/寒暄/emoji/围栏/解释：',
     '',
     '[INTENT:edit|analyze|chat]',
     '[ASK:none|choice|confirm]',
     '[CONTENT]',
     '',
-    '`- intent` 三选一：edit=改文档，analyze=给建议不动文档，chat=闲聊。',
-    '`- ask` 三选一：要给用户选项（A/B/C/D）就 choice，要 yes/no 确认就 confirm，否则 none。',
-    '',
-    '**默认 [INTENT:edit]**——用户说 "写/改/续/完善/补充/添加/插入/调整/润色/扩写/翻译/重写/修改/拼接/合并/排版/整理/起草/润色/扩写/往下/接着/继续" 等动词，直接 edit，不用问。',
-    'edit 模式正文 = 完整新文档（替换当前文档全部内容），让前端算 diff。',
+    'intent：edit=改文档（输出完整新文档替换全部），analyze=给建议不动文档，chat=闲聊。',
+    'ask：要给用户选项（A/B/C/D）就 choice，要 yes/no 确认就 confirm，否则 none。',
+    '默认 edit —— 任何写/改/续/完善/补充/翻译/重写/接着/继续 → 直接 edit。',
     '',
     '你是 aiWord 写作助手。',
     `风格：${tone}。长度：${length}。语言：${lang}。`,
     '',
-    '其他规则：',
-    '- [INTENT] / [ASK] 整份回复只能各出现一次',
-    '- 正文里禁止出现任何方括号协议标记',
-    '- 不要在正文里解释自己的模式（禁止 "我来/我会/我准备/不动文档/重新输出完整文档" 等元评论）',
-    '- edit 模式必须输出完整文档，不要只输出片段/摘要/开头',
-    '- 不要输出 ```json``` 围栏；不要在标记前加任何解释、寒暄、emoji',
-    '',
-    '⚠️ 再次强调：每条回复都**必须**以 [INTENT:xxx] 开头，缺前缀 = 错误回复。',
-    '',
-    '## 多选项输出格式（弹窗里要展示的）',
-    '要给用户 2~4 个可选项时，用这种格式：',
-    '',
-    '- **路径 A**：一句话描述',
-    '- **路径 B**：一句话描述',
-    '- **路径 C**：一句话描述',
-    '',
-    '要求：key 用 A/B/C/D 大写；中文标签用 `路径/方案/选项/思路/方向/建议`；分隔符用全角 "："；单条建议时不要用这个格式。'
+    '规则：',
+    '- [INTENT]/[ASK] 各只出现一次；正文里禁止方括号协议标记',
+    '- 不要解释自己的模式（禁止"我来/我会/不动文档/重新输出完整文档"等元评论）',
+    '- edit 必须输出完整文档，不输出片段/摘要/开头',
+    '- 不要 ```json``` 围栏，不要前缀寒暄/emoji',
+    '- ASK=choice 时用 2~4 个选项：`- **路径 X**：一句话描述`（A/B/C/D 大写，单条不用此格式）'
   ].join('\n')
 }
 
@@ -157,6 +144,48 @@ export function parseStreamMeta(raw: string): StreamMeta | null {
     }
   }
   return null
+}
+
+/**
+ * contextText 截断：超过 head+tail+margin 时只留头尾，中间用 "[...已截断 N 字...]" 标记。
+ *
+ * 为什么这样截：长 doc 全量喂回去会让 input tokens 暴涨（典型 10k 字 doc = ~15k tokens）；
+ * 头尾各 4k 字通常包含"用户当前正在编辑的段落 + 文档开头设定"，对 AI 判断要不要改文档足够。
+ *
+ * margin=50 是为了 [CONTENT] 标签后正好换行这种边界场景不触发截断。
+ */
+function truncateContext(
+  text: string,
+  headChars = 4000,
+  tailChars = 4000
+): string {
+  if (text.length <= headChars + tailChars + 50) return text
+  const omitted = text.length - headChars - tailChars
+  return (
+    text.slice(0, headChars) +
+    `\n\n[...已截断 ${omitted} 字...]\n\n` +
+    text.slice(-tailChars)
+  )
+}
+
+/**
+ * history char cap：保护重 edit session，避免 20 条 edit 历史（每条 ~3000 字）
+ * 把 input tokens 顶到 10 万+。从最新的往前累加，超 cap 就丢最老的（保持对话连贯性）。
+ *
+ * 与前端 `chatHistory` `slice(-20)` entry 计数 cap 叠加：
+ * - entry cap 保结构（至少保留最近 20 轮）
+ * - char cap 保 token 上限（无论 entry 多大，单次调用 input 封顶 ~18k tokens）
+ */
+const HISTORY_MAX_CHARS = 12_000
+function capHistory(messages: Message[]): Message[] {
+  let totalChars = 0
+  const result: Message[] = []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    totalChars += messages[i].content.length
+    if (totalChars > HISTORY_MAX_CHARS) break
+    result.unshift(messages[i])
+  }
+  return result
 }
 
 /**
@@ -214,7 +243,7 @@ async function streamWith(
   const finalMessages = prefill
     ? [...messages, { role: 'assistant' as const, content: prefill }]
     : messages
-  const { text, tokens } = await provider.stream(
+  const { text, tokens, cacheRead, cacheWrite } = await provider.stream(
     {
       model: resolveModel(model ?? ''),
       system,
@@ -229,7 +258,12 @@ async function streamWith(
     onMeta({ intent: 'chat', ask: 'none' })
   }
   // 最终 text 也要拼上 prefill（上面 wrappedChunk 只拼了流到前端的增量）
-  return { text: prefill ? prefill + text : text, tokens }
+  return {
+    text: prefill ? prefill + text : text,
+    tokens,
+    cacheRead,
+    cacheWrite
+  }
 }
 
 export async function runGenerate(
@@ -243,13 +277,19 @@ export async function runGenerate(
     language: input.language
   })
 
+  // 长 doc 截断：超过 ~8k 字时只取头尾各 4k，中间标记成已截断。
+  // 这样即使用户有一篇 10 万字的长文，单次调用 context 部分也封顶在 ~12k tokens。
+  const contextText = input.contextText
+    ? truncateContext(input.contextText)
+    : undefined
+
   // 用户消息：把当前文档内容 + 用户指令一起交给 AI，
   // 让 AI 自己判断：是要改文档（[INTENT:edit]），还是只是在聊天（[INTENT:chat]）。
-  const userText = input.contextText
+  const userText = contextText
     ? `以下是当前文档的完整 Markdown 内容（用于"修改文档"类请求时参考；闲聊类请求可忽略）：
 
 \`\`\`markdown
-${input.contextText}
+${contextText}
 \`\`\`
 
 用户当前的指令：${input.prompt || '请基于以上内容继续完善'}`
@@ -258,15 +298,26 @@ ${input.contextText}
   // 组装消息：历史 + 当前指令
   // 历史里 kind==='edit' 的 assistant content 是"完整新文档"；kind==='chat' 是"AI 的回复"
   // 把它们都喂回去，让 AI 维持上下文（连续多轮对话不会失忆）
-  const messages: Message[] = []
+  const rawMessages: Message[] = []
   if (input.history?.length) {
     for (const m of input.history) {
       if (m.role === 'user' || m.role === 'assistant') {
-        messages.push({ role: m.role, content: m.content })
+        rawMessages.push({ role: m.role, content: m.content })
       }
     }
   }
-  messages.push({ role: 'user', content: userText })
+  rawMessages.push({ role: 'user', content: userText })
+  // char cap：保护重 edit session（多条 edit history 累积把 input 顶到 10 万+）
+  const messages = capHistory(rawMessages)
+
+  // 标最后一条 user 消息为 Anthropic prompt cache breakpoint。
+  // 配合 claude.ts 里 system 的 cacheControl，两段是最稳定的：
+  // - system prompt 每次 generate 都重发同一份
+  // - 最后一条 user（含 contextText + 当前 prompt）每次重发差异小，cache 命中率高
+  // 历史会变（每轮 edit 都不一样），不标 cache。
+  if (messages.length > 0) {
+    messages[messages.length - 1].cacheControl = true
+  }
 
   // assistant prefill：物理上强制模型从 [INTENT: 开头续写协议头
   // （之前只用 prompt 强调，模型长 prompt 下会"忘记"格式。prefill 是 Anthropic API
