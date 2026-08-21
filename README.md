@@ -1,8 +1,2 @@
 # aiWord
-# aiWord
-# aiWord
-# aiWord
-# aiWord
-# aiWord
-# aiWord
-# aiWord
+### 玩具级项目，自己做的写文档用的
