@@ -87,7 +87,11 @@ export const useAuthStore = defineStore('auth', () => {
         user.value = null
         hasToken.value = false
       }
-      return null
+      // 把错误抛给调用方（router.beforeEach）——之前这里 swallow 导致死锁：
+      // axios 拦截器 401 → clearTokens() → setUnauthorizedHandler → router 想 push /login
+      // 但 beforeEach 里正在 await 这个 fetchMe，错误被吞 → router 卡在 guard 里
+      // → 用户看到的就是"页面加载不出来，没报错"
+      throw err
     } finally {
       fetchingMe.value = false
     }

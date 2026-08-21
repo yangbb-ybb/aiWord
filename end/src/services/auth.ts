@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
-import { and, eq, lt, isNull } from 'drizzle-orm'
+import { and, eq, lt } from 'drizzle-orm'
 import { env } from '~/config/env'
 import { db } from '~/db'
 import { refreshTokens, smsCodes, users, type UserRow } from '~/db/schema'
@@ -96,6 +96,9 @@ export async function rotateRefreshToken(oldToken: string) {
   if (decoded.type !== 'refresh') throw authError('REFRESH_INVALID', 'token 类型错误')
 
   // 2) 数据库里要存在、未撤销、未过期
+  // ⚠️ 必须用 `eq(refreshed, false)`，不能用 `isNull(refreshed)`：
+  //    schema 里 revoked 默认值是 `false`（tinyint(1) 默认 0），不是 NULL。
+  //    isNull 在 SQL 里转成 `IS NULL`，永远不命中，导致每次 refresh 都 REFRESH_REVOKED。
   const tokenHash = hashToken(oldToken)
   const rows = await db
     .select()
@@ -103,7 +106,7 @@ export async function rotateRefreshToken(oldToken: string) {
     .where(
       and(
         eq(refreshTokens.tokenHash, tokenHash),
-        isNull(refreshTokens.revoked)
+        eq(refreshTokens.revoked, false)
       )
     )
     .limit(1)

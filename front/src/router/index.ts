@@ -59,11 +59,16 @@ router.beforeEach(async (to) => {
   // 有 token 但 store 里还没有 user：尝试拉一次
   const auth = useAuthStore()
   if (!auth.user) {
-    console.log(1);
-    await auth.fetchMe()
-    // if (!auth.user) {
-    //   return { path: '/login', query: { redirect: to.fullPath } }
-    // }
+    try {
+      await auth.fetchMe()
+    } catch {
+      // fetchMe 现在会显式把 401 抛出来（之前 swallow 导致 router 卡在 guard 里死锁），
+      // 抛错后落到这里走 login 重定向
+      return { path: '/login', query: { redirect: to.fullPath } }
+    }
+    if (!auth.user) {
+      return { path: '/login', query: { redirect: to.fullPath } }
+    }
   }
   return true
 })

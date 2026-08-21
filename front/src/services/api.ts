@@ -230,7 +230,7 @@ async function doRefresh(): Promise<{ accessToken: string; refreshToken: string 
   // 关键：把 refreshing 提前占位（singleton），后续同 tab 再有 401 都复用同一个 promise。
   // 不能等到 peer wait 完再设 —— 否则 wait 期间同 tab 并发 401 会绕过 singleton，重复发 refresh。
   const id = Math.random().toString(36).slice(2)
-  refreshing = (async () => {
+  const corePromise = (async () => {
     // 1) 跨 tab 协调：广播问一句"有没有人在 refresh"，等最多 1.5s
     if (REFRESH_CHANNEL) REFRESH_CHANNEL.postMessage({ type: 'refresh:start', id } as RefreshMsg)
     const peerResult = await waitForOtherTabRefresh(id)
@@ -258,9 +258,15 @@ async function doRefresh(): Promise<{ accessToken: string; refreshToken: string 
         : toApiError(err as AxiosError<BackendEnvelopeError>)
     }
   })()
-  // 不论成功失败都要清空 singleton，否则一次失败会导致后续所有 401 都拿到同一个 rejected promise
-  // —— 表现为"refresh 之后再也不能 refresh"，看起来 refresh token 完全失效。
-  refreshing.finally(() => {
+  // ⚠️ 关键：把 `.finally(cb)` 包装后的 promise 赋给 refreshing，**并 return 它**。
+  // 旧实现是 `refreshing = corePromise` + `corePromise.finally(cb)` + `return refreshing`，
+  // 但 .finally() 返回的是**新** promise，没人 await 它，cb 里清空 singleton 的代码
+  // 跑不跑全看微任务调度；调用方 await 的是 corePromise，cb 还没跑就拿到 tokens 返回了，
+  // 此时 refreshing 仍指向已 settled 的 corePromise —— 新 401 调进来会被
+  // `if (refreshing)` 命中并复用同一个 promise，singleton 形同虚设。
+  // 正确做法：让 refreshing 指向 finally() 包装后的 promise，调用方 await 的也是它，
+  // cb 必然先于 caller 拿到结果执行 —— 然后才轮到 caller resolve。
+  refreshing = corePromise.finally(() => {
     refreshing = null
   })
   return refreshing
@@ -358,7 +364,26 @@ function createHttp(_opts: { on401Redirect?: boolean }): AxiosInstance {
 }
 
 const http = createHttp({ on401Redirect: true })
-const refreshHttp = createHttp({ on401Redirect: false })
+
+/**
+ * refresh 专用 axios 实例 —— 必须是**裸**的，不能复用 createHttp() 的拦截器：
+ *
+ *   http 的请求拦截器里 `await ensureFreshToken()` → `doRefresh()` → `api.refresh()`
+ *   → 如果 refreshHttp 也挂了同一个拦截器，就会重入：
+ *     - 当前 refresh 在等 refreshHttp.post 返回
+ *     - refreshHttp.post 在等自己的请求拦截器（ensureFreshToken）
+ *     - ensureFreshToken 在等 `refreshing` 单例
+ *     - 单例是当前 refresh 的 finally 包装
+ *     - → 四方互相 await，环死锁，end 永远打不出来
+ *
+ *   refresh 自己是 preflight 的目的，再 preflight 自己没意义。
+ *   401 也直接在调用方处理（doRefresh 的 catch），不需要 refresh 实例再来一遍。
+ */
+const refreshHttp = axios.create({
+  baseURL: BASE_URL,
+  timeout: 30_000,
+  headers: { 'content-type': 'application/json' }
+})
 
 /**
  * 拆信封：axios 返回的 AxiosResponse.data 是 { code, data, ... }，
