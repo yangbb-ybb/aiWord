@@ -376,6 +376,13 @@ async function streamWith(
   }
 }
 
+/**
+ * 主入口：续写/改写文档。
+ * - 带 contextText → AI 可走 [INTENT:edit] 改文档
+ * - 不带 contextText → AI 当成"自由创作"，默认 [INTENT:edit] 起新文档
+ * - 历史通过 input.history 喂回去，多轮对话上下文不断
+ * - 用 prefill '[INTENT:' 物理强制模型写协议头，让前端能区分 edit/analyze/chat
+ */
 export async function runGenerate(
   input: GenerateInput,
   onChunk: (delta: string) => void,
@@ -442,6 +449,10 @@ ${contextText}
   )
 }
 
+/**
+ * 局部改写：在用户选中的文本片段上润色/精修，保留 Markdown 结构。
+ * 与 runGenerate 的区别：单轮无历史，prompt 直接喂原文 + 改写要求。
+ */
 export async function runRewrite(
   input: RewriteInput,
   onChunk: (delta: string) => void,
@@ -460,6 +471,10 @@ export async function runRewrite(
   return streamWith([{ role: 'user', content: user }], system, onChunk, onMeta, input.model)
 }
 
+/**
+ * 摘要：把长文压成不超过 maxChars（默认 200）字的关键事实清单，Markdown 输出。
+ * 不发 prefill，因为摘要永远只走 chat 路径，不需要 AI 自己做 intent 决策。
+ */
 export async function runSummarize(
   input: SummarizeInput,
   onChunk: (delta: string) => void,
@@ -479,6 +494,10 @@ export async function runSummarize(
   )
 }
 
+/**
+ * 翻译：把文本翻成指定 targetLang（zh / en / mixed），保留 Markdown / 代码 / 链接。
+ * 同样不发 prefill，固定走 chat 路径。
+ */
 export async function runTranslate(
   input: TranslateInput,
   onChunk: (delta: string) => void,

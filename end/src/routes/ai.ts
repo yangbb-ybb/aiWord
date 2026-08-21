@@ -85,12 +85,17 @@ function ensureAiAvailable(req: any, reply: any): boolean {
  * done 事件附带 cacheRead/cacheWrite：来自 Anthropic prompt cache 命中/写入 tokens，
  * 前端可在 UI 上展示"本次命中 cache X tokens"，让用户感知 prompt caching 的省钱效果。
  *
+ * `input` 是本次请求的**结构化入参快照**（端点、model、tone、字数、文本长度等），会同时写进
+ * 服务端日志（done/failed 两条都带）。这样排查时一条日志就能看到"调用了哪个端点 + 带了什么参数
+ * + 消耗多少 token + 花了多久"，不用再去 grep _start 拼上下文。各 route 负责挑出自己关心的字段。
+ *
  * runner 是 (onChunk, onMeta) => Promise<{text, tokens, cacheRead?, cacheWrite?}>；这里再套一层日志和计时。
  */
 async function streamAi(
   req: any,
   reply: any,
   event: string,
+  input: Record<string, unknown>,
   runner: (
     onChunk: (delta: string) => void,
     onMeta: (meta: { intent: 'edit' | 'analyze' | 'chat'; ask: 'none' | 'choice' | 'confirm' }) => void
@@ -141,6 +146,12 @@ async function streamAi(
     req.log.info(
       {
         aiEvent: event,
+        // HTTP 上下文：让 done 日志自包含，看一条就知道 method+route+body 摘要+指标，
+        // 不用再回去 grep incoming request / _start 拼上下文
+        method: req.method,
+        route: req.routerPath ?? req.url,
+        // 入参快照：端点(model/tone/lang/target...) + 文本长度，避免事后排查时去 grep 上一条 _start
+        input,
         tokens: result.tokens ?? 0,
         cacheRead: result.cacheRead ?? 0,
         cacheWrite: result.cacheWrite ?? 0,
@@ -155,6 +166,10 @@ async function streamAi(
     req.log.error(
       {
         aiEvent: event,
+        // 失败也带 method/route/input —— 失败日志的价值 80% 在于能复现"用户当时发了啥"
+        method: req.method,
+        route: req.routerPath ?? req.url,
+        input,
         err,
         durationMs: Date.now() - start
       },
@@ -166,77 +181,74 @@ async function streamAi(
   }
 }
 
+// ai 接口
 export default async function aiRoutes(app: FastifyInstance) {
   app.post('/generate', async (req, reply) => {
     if (!ensureAiAvailable(req, reply)) return
     const body = generateBody.parse(req.body)
-    // 单独写一条"开始生成"的日志，方便排查
-    req.log.info(
+    await streamAi(
+      req,
+      reply,
+      'generate',
       {
-        aiEvent: 'generate_start',
         model: body.model ?? '(default)',
         tone: body.tone ?? '(default)',
         length: body.length ?? '(default)',
         language: body.language ?? '(default)',
         promptChars: body.prompt.length,
-        contextChars: body.contextText?.length ?? 0
+        contextChars: body.contextText?.length ?? 0,
+        historyLen: body.history?.length ?? 0
       },
-      'ai generate start'
-    )
-    await streamAi(req, reply, 'generate', (onChunk, onMeta) =>
-      runGenerate(body, onChunk, onMeta)
+      (onChunk, onMeta) => runGenerate(body, onChunk, onMeta)
     )
   })
 
   app.post('/rewrite', async (req, reply) => {
     if (!ensureAiAvailable(req, reply)) return
     const body = rewriteBody.parse(req.body)
-    req.log.info(
+    await streamAi(
+      req,
+      reply,
+      'rewrite',
       {
-        aiEvent: 'rewrite_start',
         model: body.model ?? '(default)',
         tone: body.tone ?? '(default)',
         textChars: body.text.length,
         instructionChars: body.instruction?.length ?? 0
       },
-      'ai rewrite start'
-    )
-    await streamAi(req, reply, 'rewrite', (onChunk, onMeta) =>
-      runRewrite(body, onChunk, onMeta)
+      (onChunk, onMeta) => runRewrite(body, onChunk, onMeta)
     )
   })
 
   app.post('/summarize', async (req, reply) => {
     if (!ensureAiAvailable(req, reply)) return
     const body = summarizeBody.parse(req.body)
-    req.log.info(
+    await streamAi(
+      req,
+      reply,
+      'summarize',
       {
-        aiEvent: 'summarize_start',
         model: body.model ?? '(default)',
-        textChars: body.text.length,
-        maxChars: body.maxChars ?? '(default)'
+        maxChars: body.maxChars ?? '(default)',
+        textChars: body.text.length
       },
-      'ai summarize start'
-    )
-    await streamAi(req, reply, 'summarize', (onChunk, onMeta) =>
-      runSummarize(body, onChunk, onMeta)
+      (onChunk, onMeta) => runSummarize(body, onChunk, onMeta)
     )
   })
 
   app.post('/translate', async (req, reply) => {
     if (!ensureAiAvailable(req, reply)) return
     const body = translateBody.parse(req.body)
-    req.log.info(
+    await streamAi(
+      req,
+      reply,
+      'translate',
       {
-        aiEvent: 'translate_start',
         model: body.model ?? '(default)',
         targetLang: body.targetLang,
         textChars: body.text.length
       },
-      'ai translate start'
-    )
-    await streamAi(req, reply, 'translate', (onChunk, onMeta) =>
-      runTranslate(body, onChunk, onMeta)
+      (onChunk, onMeta) => runTranslate(body, onChunk, onMeta)
     )
   })
 
