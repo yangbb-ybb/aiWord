@@ -130,10 +130,18 @@ const LEADIN_META_RE =
 
 function sanitizeAiBody(text: string): string {
   let body = stripProtocolInline(text).trimStart()
-  // 1) 优先尝试剥掉围栏，只留围栏内文（这是模型给"完整新文档"时的标准形态）
-  const fenced = body.match(FENCED_DOC_RE)
-  if (fenced) {
-    return fenced[1].trim()
+  // 1) 优先尝试剥掉围栏，只留围栏内文（这是模型给"完整新文档"时的标准形态）。
+  //    ⚠️ 必须确认围栏**完整包住**整个 body 才可以剥掉：body 以 ``` 开头**且**以 ``` 结尾。
+  //    否则会把"文档里用来展示示例的代码块"误当成"包裹整篇文档的围栏"，丢光所有正文。
+  //    （真实踩坑：AI 写 EventSource 教程时，里面有个 ``` 块展示 SSE 报文格式：
+  //      event: message / id: 1024 / data: {...}，被当成全文围栏剥掉，
+  //      diff 只剩这 3 行，正文全丢了。）
+  const isFullyFenced = body.startsWith('```') && body.endsWith('```')
+  if (isFullyFenced) {
+    const fenced = body.match(FENCED_DOC_RE)
+    if (fenced) {
+      return fenced[1].trim()
+    }
   }
   // 2) 没有围栏但开头是元评论引导句 → 丢掉第一行（保留后续真实正文）
   // 严格点：只有在引导句之后还有实质内容（>= 200 字 / 含 markdown 标题）才动，
