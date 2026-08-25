@@ -80,7 +80,7 @@ function buildSystem(opts: {
     '[ASK:none|choice|confirm]',
     '[CONTENT]',
     '',
-    'intent 定义：edit=改文档（输出完整新文档替换全部），analyze=给建议不动文档，chat=闲聊/问答/确认。',
+    'intent 定义：edit=改文档（输出 SEARCH/REPLACE 增量操作），analyze=给建议不动文档，chat=闲聊/问答/确认。',
     'ask：要给用户选项（A/B/C/D）就 choice，要 yes/no 确认就 confirm，否则 none。',
     '',
     '判定优先级（高 → 低）：',
@@ -88,12 +88,33 @@ function buildSystem(opts: {
     '2. analyze：用户在问"哪里有问题 / 怎么改更好 / 给建议"，但不要直接改文档',
     '3. chat：默认！闲聊/问答/确认/与文档主题无关 → 统统 chat',
     '',
-    'edit 模式必须输出完整新文档；analyze/chat 只输出回复正文，不要 dump 文档原文。',
+    '═══ edit 模式专用：SEARCH/REPLACE 增量协议 ═══',
+    'edit 模式不要输出完整新文档！只输出**增量操作**。',
+    '针对性修改一段 → 用 SEARCH/REPLACE（每块一个独立改动）：',
+    '<<<SEARCH>>>',
+    '当前文档里要替换的那一段原文（必须能在文档里**唯一**匹配）',
+    '>>>REPLACE>>>',
+    '替换后的新内容',
+    '<<<END>>>',
+    '',
+    '整篇重写/从头起草 → 用 REPLACE_ALL（一份覆盖整个文档）：',
+    '<<<REPLACE_ALL>>>',
+    '完整的新文档内容',
+    '<<<END>>>',
+    '',
+    '规则：',
+    '- SEARCH 锚点必须在文档里**唯一**出现（不唯一就重写得更具体、加上下文行）',
+    '- REPLACE_ALL 只能 0 或 1 次；一旦出现就完全替换文档，SEARCH/REPLACE 不再生效',
+    '- 多个独立改动 → 多个 SEARCH/REPLACE 块，按文档顺序排列（先出现的替换先执行）',
+    '- 不要在正文里出现任何 markdown 围栏（```...```）；不要"以下是…"元评论',
+    '',
+    '═══ analyze/chat 模式 ═══',
+    '只输出回复正文，不要 dump 文档原文。',
     '',
     '你是 aiWord 写作助手。',
     `风格：${tone}。长度：${length}。语言：${lang}。`,
     '',
-    '规则：',
+    '通用规则：',
     '- [INTENT]/[ASK] 各只出现一次；正文里禁止方括号协议标记',
     '- 不要解释自己的模式（禁止"我来/我会/不动文档/重新输出完整文档"等元评论）',
     '- 不要 ```json``` 围栏，不要前缀寒暄/emoji',
@@ -108,6 +129,70 @@ function buildSystem(opts: {
 export type StreamMeta = {
   intent: 'edit' | 'analyze' | 'chat'
   ask: 'none' | 'choice' | 'confirm'
+}
+
+/**
+ * edit 模式的增量操作（SEARCH/REPLACE + REPLACE_ALL）。
+ * - search_replace: 在 baseContent 里查 search 子串，替换为 replace
+ * - replace_all:    整篇替换 baseContent 为 content
+ *
+ * 后端 `streamWith` 在协议头解析后从 rawBuffer 解析 ops，通过 SSE `done.ops` 一次性下发。
+ * 前端 `applyOps()` 负责把 ops 应用到 baseContent 得到 postContent。
+ */
+export type EditOp =
+  | { type: 'search_replace'; search: string; replace: string }
+  | { type: 'replace_all'; content: string }
+
+export interface ParseEditOpsResult {
+  ops: EditOp[]
+  errors: string[]
+}
+
+/**
+ * 从 AI [CONTENT] 之后的正文里解析 op 块。
+ *
+ * 容忍：
+ * - search/replace 内容里可能有空行、特殊字符（不含 `<<<END>>>` 行本身）
+ * - 多个 SEARCH/REPLACE 块按文档顺序返回
+ * - REPLACE_ALL 块只能出现 0 或 1 次
+ *
+ * 不容忍 / 算 errors：
+ * - op 块没有正确闭合（start/end 不匹配）
+ * - REPLACE_ALL 出现 > 1 次
+ *
+ * 返回的 ops 即使有 errors 也尽量可用——前端 apply 时再做二次校验。
+ */
+export function parseEditOps(raw: string): ParseEditOpsResult {
+  const ops: EditOp[] = []
+  const errors: string[] = []
+
+  // 先剥掉 [INTENT]/[ASK]/[CONTENT] 等协议头（如果 AI 把它们也吐进正文了）
+  const text = raw.replace(PROTOCOL_INLINE_RE, '')
+
+  // 一次性正则：要么匹配 SEARCH/REPLACE 块，要么匹配 REPLACE_ALL 块
+  // 内容捕获用非贪婪，遇到下一行的 <<<END>>> 才停
+  const RE = /<<<SEARCH>>>\s*\n([\s\S]*?)\n>>>REPLACE>>>\s*\n([\s\S]*?)\n<<<END>>>\s*\n?|<<<REPLACE_ALL>>>\s*\n([\s\S]*?)\n<<<END>>>\s*\n?/g
+
+  let m: RegExpExecArray | null
+  let replaceAllCount = 0
+  while ((m = RE.exec(text)) !== null) {
+    if (m[1] !== undefined && m[2] !== undefined) {
+      ops.push({
+        type: 'search_replace',
+        search: m[1],
+        replace: m[2]
+      })
+    } else if (m[3] !== undefined) {
+      ops.push({ type: 'replace_all', content: m[3] })
+      replaceAllCount++
+    }
+  }
+
+  if (replaceAllCount > 1) {
+    errors.push(`REPLACE_ALL 出现 ${replaceAllCount} 次，只能 0 或 1 次`)
+  }
+
+  return { ops, errors }
 }
 
 /**
@@ -188,7 +273,15 @@ const CHOICE_LINE_RE =
  */
 export function inferMetaFromBody(raw: string): StreamMeta {
   const text = raw.replace(PROTOCOL_INLINE_RE, '').trim()
-  // ```markdown 围栏包住的整块 —— 模型用围栏交付"完整新文档"的典型形态
+  // 新协议：AI 输出 SEARCH/REPLACE 或 REPLACE_ALL → 视为 edit 模式
+  const hasEditOp = /<<<SEARCH>>>|<<<REPLACE_ALL>>>/.test(text)
+  if (hasEditOp) {
+    return {
+      intent: 'edit',
+      ask: CHOICE_LINE_RE.test(text) ? 'choice' : 'none'
+    }
+  }
+  // 老路径兼容：```markdown 围栏包住的整块 —— 模型用围栏交付"完整新文档"的典型形态
   const fenced = text.match(/```(?:markdown|md)?\s*\n([\s\S]*?)```/i)
   const doc = fenced ? fenced[1] : text
   const headings = (doc.match(/^#{1,6}\s+\S/gm) ?? []).length
@@ -259,7 +352,16 @@ async function streamWith(
   onMeta: ((meta: StreamMeta) => void) | undefined,
   model?: string,
   prefill?: string
-) {
+): Promise<{
+  text: string
+  tokens?: number
+  cacheRead?: number
+  cacheWrite?: number
+  /** edit 模式的解析后 op 数组；chat/analyze 模式始终为空数组 */
+  ops: EditOp[]
+  /** parseEditOps 的诊断信息（如 REPLACE_ALL 出现多次） */
+  opErrors: string[]
+}> {
   const provider = getProvider()
   // rawBuffer 始终包含 prefill（拼过就拼，没拼过就不拼），保证 parseStreamMeta 的非锚定正则
   // 能找到完整 `[INTENT:edit]\n[ASK:xxx]\n[CONTENT]`。用户实际看到的 onChunk 输出走另一条路。
@@ -368,11 +470,16 @@ async function streamWith(
   // 返回给调用方的完整 text：与流到前端的拼接策略保持一致
   const stitchPrefill = prefillInjected === 'yes'
   const finalText = stitchPrefill && prefill ? prefill + text : text
+  // 解析 edit ops：只有声明了 edit 模式才解析（chat/analyze 模式 AI 不输出 op 块），
+  // 但安全起见只要 rawBuffer 里出现 op 标记就尝试解析 —— 万一 meta 误判也能兜住
+  const { ops, errors: opErrors } = parseEditOps(rawBuffer)
   return {
     text: finalText,
     tokens,
     cacheRead,
-    cacheWrite
+    cacheWrite,
+    ops,
+    opErrors
   }
 }
 

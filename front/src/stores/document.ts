@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { diffLines } from 'diff'
 import { api, ApiError } from '@/services/api'
 import { postStream } from '@/services/stream'
+import type { EditOp } from '@/services/stream'
 
 export type Platform = 'wechat' | 'zhihu' | 'csdn' | 'juejin'
 
@@ -154,6 +155,108 @@ function sanitizeAiBody(text: string): string {
     if (afterHasDoc) return after
   }
   return body
+}
+
+/* ──────────────────────────────────────────────────────────────────
+ * 新协议：SEARCH/REPLACE + REPLACE_ALL 增量编辑
+ * ────────────────────────────────────────────────────────────────── */
+
+/**
+ * 把 AI 流式文本里的 `<<<SEARCH>>>` / `>>>REPLACE>>>` / `<<<REPLACE_ALL>>>` /
+ * `<<<END>>>` 标记行去掉，返回"标记剥光后的纯文本"。
+ *
+ * 用于 edit 模式流式预览期间：用户看到的是剥光标记后的中间状态（而不是原始 op 流），
+ * 否则用户会看到 `<<<SEARCH>>>` 这种奇怪的指令。
+ *
+ * 不做语义校验（只看是不是独立一行），可能误伤文档里恰好长这样的文本，但概率极低
+ * （4 个尖括号模式本身就很独特），且只在 edit 流式预览期间显示，不影响最终落库结果。
+ */
+function stripOpMarkers(text: string): string {
+  return text
+    .replace(/^\s*<<<SEARCH>>>\s*\n?/gm, '')
+    .replace(/^\s*>>>REPLACE>>>\s*\n?/gm, '')
+    .replace(/^\s*<<<REPLACE_ALL>>>\s*\n?/gm, '')
+    .replace(/^\s*<<<END>>>\s*\n?/gm, '')
+}
+
+/**
+ * 从 AI 原始回复里解析 SEARCH/REPLACE + REPLACE_ALL op 块。
+ *
+ * 返回的 ops 即使只有部分完整块也能被前端利用（每个 op 是独立的，应用一次成功一次）；
+ * 应用失败（SEARCH 锚点不唯一 / 找不到）会被 applyOps() 收集到 warnings 而非抛错，
+ * 这样用户至少能接受"成功的部分"，再单独处理失败的部分。
+ */
+export function parseEditOps(raw: string): { ops: EditOp[]; errors: string[] } {
+  const ops: EditOp[] = []
+  const errors: string[] = []
+  // 与后端 parseEditOps 同语义，但前端只信任自己解析出来的（万一后端漏字段）
+  const RE =
+    /<<<SEARCH>>>\s*\n([\s\S]*?)\n>>>REPLACE>>>\s*\n([\s\S]*?)\n<<<END>>>\s*\n?|<<<REPLACE_ALL>>>\s*\n([\s\S]*?)\n<<<END>>>\s*\n?/g
+  let m: RegExpExecArray | null
+  let replaceAllCount = 0
+  while ((m = RE.exec(raw)) !== null) {
+    if (m[1] !== undefined && m[2] !== undefined) {
+      ops.push({ type: 'search_replace', search: m[1], replace: m[2] })
+    } else if (m[3] !== undefined) {
+      ops.push({ type: 'replace_all', content: m[3] })
+      replaceAllCount++
+    }
+  }
+  if (replaceAllCount > 1) {
+    errors.push(`REPLACE_ALL 出现 ${replaceAllCount} 次，只能 0 或 1 次`)
+  }
+
+  // 输出log
+  console.log({ops, errors});
+  return { ops, errors }
+}
+
+/**
+ * 把 ops 应用到 baseContent，得到新的完整文档。
+ *
+ * 应用规则（按文档顺序）：
+ * - 任意 op 是 REPLACE_ALL → **完全覆盖** baseContent（后续 SEARCH/REPLACE 不再生效）
+ * - SEARCH/REPLACE：在 baseContent 里查找 search 子串，**唯一匹配**则替换为 replace；
+ *   不唯一 / 找不到 → 跳过该 op + 收集到 warnings，不抛错
+ *
+ * 返回 warnings 让 UI 可以提示用户"3 个块未能匹配"，让用户决定是接受部分改动还是 reject 全部。
+ */
+export function applyOps(
+  base: string,
+  ops: EditOp[]
+): { result: string; warnings: string[] } {
+  const warnings: string[] = []
+  // REPLACE_ALL 优先：一旦出现（按顺序，第一个 REPLACE_ALL 生效）就完全覆盖
+  for (const op of ops) {
+    if (op.type === 'replace_all') {
+      return { result: op.content, warnings }
+    }
+  }
+  // SEARCH/REPLACE：顺序应用
+  let result = base
+  for (const op of ops) {
+    if (op.type === 'search_replace') {
+      const idx = result.indexOf(op.search)
+      if (idx === -1) {
+        warnings.push(`未找到 SEARCH 锚点：${truncate(op.search, 40)}`)
+        continue
+      }
+      // 唯一性检查：找第二个匹配
+      const secondIdx = result.indexOf(op.search, idx + 1)
+      if (secondIdx !== -1) {
+        warnings.push(`SEARCH 锚点不唯一：${truncate(op.search, 40)}`)
+        continue
+      }
+      result =
+        result.slice(0, idx) + op.replace + result.slice(idx + op.search.length)
+    }
+  }
+  return { result, warnings }
+}
+
+/** 截断 + 加省略号，用于 warnings 显示 */
+function truncate(s: string, n: number): string {
+  return s.length <= n ? s : s.slice(0, n) + '…'
 }
 
 /**
@@ -559,7 +662,10 @@ export const useDocumentStore = defineStore('document', () => {
    * 结构：
    * - docId: 针对哪篇文档
    * - preContent: 生成前的原文（用于"拒绝"时回滚）
-   * - postContent: AI 生成的完整新文档
+   * - postContent: **重建后的完整新文档**（来自本地 applyOps(baseContent, ops)，
+   *              AI 在新协议下只吐 SEARCH/REPLACE 增量，由前端重建完整文档）
+   * - ops: AI 给出的原始 op 数组（用于调试/回放；opErrors 反映应用时的诊断信息）
+   * - opWarnings: 应用失败的部分（如 SEARCH 锚点不唯一），UI 可选 toast 提示
    * - diffParts: 行级 diff 片段（绿色新增 / 红色删除），给 UI 展示
    * - prompt: 用户这一轮的指令（写进聊天历史用）
    */
@@ -567,6 +673,8 @@ export const useDocumentStore = defineStore('document', () => {
     docId: string
     preContent: string
     postContent: string
+    ops: EditOp[]
+    opWarnings: string[]
     diffParts: Array<{ value: string; added?: boolean; removed?: boolean }>
     prompt: string
   } | null>(null)
@@ -800,6 +908,9 @@ export const useDocumentStore = defineStore('document', () => {
     let detected: AiIntent | null = opts.forceMode ?? null
     // AI 自己声明的"是否在等用户做选择"，由后端 SSE `meta` 事件结构化下发
     let detectedAsk: AiAsk = 'none'
+    // 后端 SSE `done` 事件带回来的 op 数组（权威源，编辑模式的最终状态以此为准）
+    let capturedOps: EditOp[] = []
+    let capturedOpErrors: string[] = []
 
     // streamingPreview 的角色变化：
     // - chat/analyze 模式 → 右栏用它判断"AI 正在打字"（isChatStreaming）
@@ -889,6 +1000,11 @@ export const useDocumentStore = defineStore('document', () => {
      * 30ms 节流（≈30fps）：流式 chunk 通常 50-100ms 一个，30ms 节流保证每收到 1~2 个 chunk
      * 就重算一次 diff，视觉上"分片对比"非常顺滑。diffLines 对中等长度 markdown
      * （< 5000 字）耗时 < 5ms，30fps 完全扛得住。
+     *
+     * 新协议下 AI 输出的是 SEARCH/REPLACE op 块，本函数尝试解析已完成（遇到 <<<END>>>）的 op
+     * 并 apply 到 baseContent，得到 postContent。这样用户看到的是"重建后的新文档"diff，
+     * 而不是 op 标记本身。如果 AI 还在写第一个 op（未到 <<<END>>>）→ 临时 fallback 到
+     * stripOpMarkers(sanitizeAiBody(contentBuffer)) 显示剥光标记的中间状态。
      */
     let pendingDiffTimer: ReturnType<typeof setTimeout> | null = null
     // 局部计数器：每次 flushPushPendingDiff 触发，pendingDiffRevision.value++
@@ -899,20 +1015,42 @@ export const useDocumentStore = defineStore('document', () => {
         flushPushPendingDiff()
       }, 30)
     }
-    function flushPushPendingDiff() {
+    function flushPushPendingDiff(overrideOps?: EditOp[]) {
       if (pendingDiffTimer) {
         clearTimeout(pendingDiffTimer)
         pendingDiffTimer = null
       }
-      // 同步去协议头 / 围栏 / 引导句：保证 pendingDiff.postContent 干净，
-      // 后续 acceptPendingDiff → updateContent 写回文档时不会带"以下是..."等元评论
-      const cleaned = sanitizeAiBody(contentBuffer)
-      const diffParts = diffLines(baseContent, cleaned)
+      let postContent: string
+      let ops: EditOp[]
+      let warnings: string[]
+      if (overrideOps && overrideOps.length > 0) {
+        // 流结束：使用后端解析好的 ops（权威源），重建完整新文档
+        const r = applyOps(baseContent, overrideOps)
+        postContent = r.result
+        ops = overrideOps
+        warnings = r.warnings
+      } else {
+        // 流式过程中：本地解析已完成 op；没有就退到剥光标记的中间状态
+        const parsed = parseEditOps(contentBuffer)
+        if (parsed.ops.length > 0) {
+          const r = applyOps(baseContent, parsed.ops)
+          postContent = r.result
+          ops = parsed.ops
+          warnings = r.warnings
+        } else {
+          postContent = stripOpMarkers(sanitizeAiBody(contentBuffer))
+          ops = []
+          warnings = []
+        }
+      }
+      const diffParts = diffLines(baseContent, postContent)
       pendingDiffRevision.value++
       pendingDiff.value = {
         docId: doc.id,
         preContent: baseContent,
-        postContent: cleaned,
+        postContent,
+        ops,
+        opWarnings: warnings,
         diffParts,
         prompt: opts.prompt ?? ''
       }
@@ -989,6 +1127,13 @@ export const useDocumentStore = defineStore('document', () => {
               schedulePushPendingDiff() // edit 模式：立刻初始化 diff
             }
             pushPreview()
+          },
+          // 后端 SSE `done` 事件：捕获后端解析好的 ops（编辑模式的权威源）。
+          // 注意：此处只"存"，不直接 flush —— 流结束后在 try-catch 外统一做最后一次 flush，
+          // 保证 chat/analyze 模式（不需要 diff）不会因 capturedOps 空而误走 diff 分支。
+          onDone(payload) {
+            capturedOps = payload.ops ?? []
+            capturedOpErrors = payload.opErrors ?? []
           }
         }
       )
@@ -1010,7 +1155,19 @@ export const useDocumentStore = defineStore('document', () => {
       }
 
       // ============ edit：flush 最后一次 diff，确保用的是完整内容 ============
-      flushPushPendingDiff()
+      // 优先用后端解析好的 ops（权威）重建 postContent；
+      // AI 没走 op 协议（fallback / chat 模式）→ capturedOps 为空，走老逻辑：sanitizeAiBody + diffLines
+      if (capturedOps.length > 0) {
+        flushPushPendingDiff(capturedOps)
+      } else {
+        flushPushPendingDiff()
+      }
+      // op 解析错误（如 REPLACE_ALL 出现多次）→ toast 提示用户，让用户知道部分 op 没生效
+      if (capturedOpErrors.length > 0) {
+        // 用 console.warn 兜底；UI 上原本就有 pendingDiff 显示，应用失败的细节已经写在
+        // pendingDiff.opWarnings 里（applyOps 返回），这里只把后端的"协议级"错误打出来
+        console.warn('[generate] op parse errors:', capturedOpErrors)
+      }
       streamingPreview.value = null
       // edit 模式下 user/AI 消息不在这里加，等用户点"接受"再追加（拒绝则整个一轮都不算）
       return { content: cleanedContent, mode: 'edit' }

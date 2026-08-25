@@ -27,7 +27,25 @@ export interface StreamDoneEvent {
   cacheRead?: number
   /** 本次请求新写入 cache 的 tokens */
   cacheWrite?: number
+  /**
+   * edit 模式解析后的增量操作（SEARCH/REPLACE + REPLACE_ALL）。
+   * chat/analyze 模式为空数组。
+   *
+   * 前端拿到 ops 后本地 apply 到 baseContent，得到 postContent —— 比让 AI 吐整篇文档省 90%+ token。
+   * AI 没按新协议输出时（走 fallback 路径）也会是空数组，此时退回旧的"全文 diff"逻辑。
+   */
+  ops?: EditOp[]
+  /**
+   * parseEditOps 的诊断信息（如 REPLACE_ALL 出现多次）—— 前端可据此 toast 提示用户。
+   */
+  opErrors?: string[]
 }
+
+/** 单个增量编辑操作（与后端 EditOp 保持一致） */
+export type EditOp =
+  | { type: 'search_replace'; search: string; replace: string }
+  | { type: 'replace_all'; content: string }
+
 export interface StreamErrorEvent {
   message: string
 }

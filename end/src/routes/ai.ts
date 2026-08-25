@@ -99,7 +99,16 @@ async function streamAi(
   runner: (
     onChunk: (delta: string) => void,
     onMeta: (meta: { intent: 'edit' | 'analyze' | 'chat'; ask: 'none' | 'choice' | 'confirm' }) => void
-  ) => Promise<{ text: string; tokens?: number; cacheRead?: number; cacheWrite?: number }>
+  ) => Promise<{
+    text: string
+    tokens?: number
+    cacheRead?: number
+    cacheWrite?: number
+    /** edit 模式解析后的 op 数组；chat/analyze 模式为空数组 */
+    ops?: Array<{ type: 'search_replace'; search: string; replace: string } | { type: 'replace_all'; content: string }>
+    /** parseEditOps 诊断信息（REPLACE_ALL 多次等） */
+    opErrors?: string[]
+  }>
 ) {
   // reply.raw.write() 会绕过 @fastify/cors 的 reply.send 自动注入，
   // 所以这里手动把 CORS 头带上，否则浏览器会判定跨域失败、看不到任何 chunk。
@@ -139,7 +148,11 @@ async function streamAi(
       text: result.text,
       tokens: result.tokens,
       cacheRead: result.cacheRead ?? 0,
-      cacheWrite: result.cacheWrite ?? 0
+      cacheWrite: result.cacheWrite ?? 0,
+      // edit 模式的解析后 op 数组；chat/analyze 模式为空数组或不发送
+      ops: result.ops ?? [],
+      // 解析诊断（如 REPLACE_ALL 出现多次）—— 前端可据此 toast 提示
+      opErrors: result.opErrors ?? []
     })
     // 默认把 AI 完整回复原文写进日志（最长 ~16k 字符），方便本地调试和回溯。
     // 想关掉就在 end/.env 里设 LOG_AI_OUTPUT=false —— output 字段就不会出现在日志里。
@@ -157,6 +170,10 @@ async function streamAi(
         cacheWrite: result.cacheWrite ?? 0,
         chunks: chunkCount,
         outputChars: result.text.length,
+        // edit 模式 op 统计：SEARCH/REPLACE 块数、REPLACE_ALL 数、解析 errors
+        opsCount: result.ops?.length ?? 0,
+        replaceAllCount: (result.ops ?? []).filter((o) => o.type === 'replace_all').length,
+        opErrors: result.opErrors ?? [],
         durationMs: Date.now() - start,
         ...(env.LOG_AI_OUTPUT ? { output: result.text } : {})
       },
