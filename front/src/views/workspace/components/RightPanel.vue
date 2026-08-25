@@ -38,6 +38,21 @@ const prompt = ref('')
 /** Prompt 为空时按钮直接置灰，从源头避免空请求；与 handleGenerate 里的兜底判断保持一致 */
 const canGenerate = computed(() => !store.isGenerating && prompt.value.trim().length > 0)
 
+/** Prompt textarea 的 DOM ref，用于"自己描述修改"按钮触发后自动聚焦 */
+const promptTextareaRef = ref<HTMLTextAreaElement | null>(null)
+
+/**
+ * "自己描述修改"sentinel：始终作为 AI 选项列表的最后一项。
+ * - key 用双下划线包裹，不会跟 AI 给的 A/B/C/D 撞键
+ * - 不污染 store 的 parseChoices()（纯函数保持纯净），仅 UI 层追加
+ * - 点击走 handleCustomChoice：关弹窗 + 聚焦输入框，不走 AI 续聊
+ */
+const CUSTOM_CHOICE: ChatChoice = {
+  key: '__custom__',
+  label: '✎ 自己描述修改',
+  description: '不用 AI 的方案，自己写修改要求'
+}
+
 const modelOptions = ref<{ label: string; value: string }[]>([])
 const providerName = ref('minimax')
 const loadingModels = ref(false)
@@ -104,7 +119,7 @@ const activeChoiceMsg = computed<ChatMessage | null>(() => {
   return chatMessages.value.find((m) => m.id === id) ?? null
 })
 
-/** 当前弹窗里要展示的选项列表（来自对应消息的正文） */
+/** 当前弹窗里要展示的选项列表（来自对应消息的正文 + 末尾的"自己描述修改"） */
 const activeChoices = computed<ChatChoice[]>(() => {
   const m = activeChoiceMsg.value
   if (!m) return []
@@ -321,8 +336,14 @@ async function handleApplySuggestion(msg: ChatMessage) {
  * - 必须拼上原问题：AI 只看到"路径 A"不知道你想干嘛，回答必然又吐出选项 → 死循环
  * - 强制 forceMode='chat'：避免 AI 把"用户选了 X"误判成 edit，去推一份完整新文档
  * - 不走 prompt 输入框，绕过用户手动复制粘贴
+ *
+ * 入口分派：sentinel（"自己描述修改"）走 handleCustomChoice，不走 AI 续聊。
  */
 async function handleChoice(choice: ChatChoice) {
+  if (choice.key === CUSTOM_CHOICE.key) {
+    handleCustomChoice()
+    return
+  }
   if (!store.current) {
     ElMessage.warning('请先选择或创建文档')
     return
@@ -367,13 +388,29 @@ async function handleChoice(choice: ChatChoice) {
 }
 
 /**
- * 计算某条 AI 消息里可解析的选项。
+ * 用户选"自己描述修改"：关弹窗 + 聚焦 Prompt 输入框，让用户立即开始打字。
+ * - 不发任何请求给 AI（避免 AI 看到空指令又吐一份 A/B/C 回来）
+ * - 不动 chatThread / chatHistory（保留 AI 之前的回复，留作上下文）
+ * - 用 nextTick 等待 el-dialog 关闭动画完成后再聚焦，避免被遮罩抢焦点
+ */
+function handleCustomChoice() {
+  activeChoiceMsgId.value = null
+  nextTick(() => {
+    promptTextareaRef.value?.focus()
+  })
+}
+
+/**
+ * 计算某条 AI 消息里可解析的选项 + 末尾追加"自己描述修改"出口。
  * 只对 chat / analyze 两种非编辑类消息生效（编辑类已经在 diff 流程里）。
+ *
+ * ⚠️ 这里会无条件追加 CUSTOM_CHOICE，所以 shouldShowChoiceDialog 里用
+ * `length >= 1` 判断不会受影响；调用方拿到列表时直接遍历即可，无需再特判。
  */
 function choicesOf(msg: ChatMessage): ChatChoice[] {
   if (msg.role !== 'assistant') return []
   if (msg.kind === 'edit') return []
-  return parseChoices(msg.content)
+  return [...parseChoices(msg.content), CUSTOM_CHOICE]
 }
 
 /**
@@ -455,6 +492,7 @@ function shouldShowChoiceDialog(msg: ChatMessage): boolean {
         <div class="field">
           <label class="field__label">Prompt</label>
           <textarea
+            ref="promptTextareaRef"
             v-model="prompt"
             class="field__textarea"
             rows="4"
@@ -548,7 +586,7 @@ function shouldShowChoiceDialog(msg: ChatMessage): boolean {
                   <button
                     v-for="c in choicesOf(msg)"
                     :key="c.key"
-                    class="choice-btn"
+                    :class="['choice-btn', c.key === CUSTOM_CHOICE.key && 'choice-btn--custom']"
                     type="button"
                     :disabled="store.isGenerating"
                     @click="handleChoice(c)"
@@ -647,7 +685,7 @@ function shouldShowChoiceDialog(msg: ChatMessage): boolean {
         <button
           v-for="c in activeChoices"
           :key="c.key"
-          class="choice-btn choice-btn--modal"
+          :class="['choice-btn', 'choice-btn--modal', c.key === CUSTOM_CHOICE.key && 'choice-btn--custom']"
           type="button"
           :disabled="store.isGenerating"
           @click="pickChoice(c)"
@@ -1098,6 +1136,35 @@ function shouldShowChoiceDialog(msg: ChatMessage): boolean {
 }
 .choice-btn:hover:not(:disabled) .choice-btn__desc {
   color: rgba(255, 255, 255, 0.92);
+}
+
+/* "自己描述修改"按钮：跟 AI 给的选项视觉上区分开
+ * - 虚线边框（不像 AI 选项那么"笃定"）
+ * - 静默色（key 用 muted），让 AI 选项保持视觉主角
+ * - hover 时升级为实线 + brand 色，跟普通选项保持一致的交互感
+ */
+.choice-btn--custom {
+  border-style: dashed;
+  border-color: var(--border-color);
+  background: transparent;
+}
+.choice-btn--custom .choice-btn__key {
+  color: var(--text-muted);
+}
+.choice-btn--custom .choice-btn__desc {
+  color: var(--text-muted);
+}
+.choice-btn--custom:hover:not(:disabled) {
+  border-style: solid;
+  border-color: var(--color-brand);
+  background: var(--bg-soft, #f5f5f7);
+  color: var(--text-primary);
+}
+.choice-btn--custom:hover:not(:disabled) .choice-btn__key {
+  color: var(--color-brand);
+}
+.choice-btn--custom:hover:not(:disabled) .choice-btn__desc {
+  color: var(--text-secondary);
 }
 
 /* ============================================================

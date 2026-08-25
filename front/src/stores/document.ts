@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { diffLines } from 'diff'
+import { ElMessage } from 'element-plus'
 import { api, ApiError } from '@/services/api'
 import { postStream } from '@/services/stream'
 import type { EditOp } from '@/services/stream'
@@ -181,9 +182,10 @@ export function parseEditOps(raw: string): { ops: EditOp[]; errors: string[] } {
   // 宽松匹配整个 op 块（start marker → end marker），对换行/空格容错。
   // 之前严格要求 `\n<<<END>>>\s*\n?` 这种边界，AI 输出 `我是测试001<<<END>>>` 这种
   // 没前导换行的格式就匹配不上，fallback 到 raw 文本做 diff 会出现"原文全删"的诡异 UI。
-  const BLOCK_RE = /<<<(SEARCH|REPLACE_ALL)>>>([\s\S]*?)<<<END>>>/g
+  const BLOCK_RE = /<<<(SEARCH|REPLACE_ALL|APPEND)>>>([\s\S]*?)<<<END>>>/g
   let m: RegExpExecArray | null
   let replaceAllCount = 0
+  let appendCount = 0
   while ((m = BLOCK_RE.exec(raw)) !== null) {
     const kind = m[1]
     const body = m[2]
@@ -193,6 +195,12 @@ export function parseEditOps(raw: string): { ops: EditOp[]; errors: string[] } {
         content: body.replace(/^\n+/, '').replace(/\n+$/, '')
       })
       replaceAllCount++
+    } else if (kind === 'APPEND') {
+      ops.push({
+        type: 'append',
+        content: body.replace(/^\n+/, '').replace(/\n+$/, '')
+      })
+      appendCount++
     } else {
       // SEARCH 块：在 body 内用 indexOf 切 search / replace（不要求严格换行）
       const splitIdx = body.indexOf('>>>REPLACE>>>')
@@ -208,6 +216,9 @@ export function parseEditOps(raw: string): { ops: EditOp[]; errors: string[] } {
   if (replaceAllCount > 1) {
     errors.push(`REPLACE_ALL 出现 ${replaceAllCount} 次，只能 0 或 1 次`)
   }
+  if (appendCount > 1) {
+    errors.push(`APPEND 出现 ${appendCount} 次，只能 0 或 1 次`)
+  }
 
   // 输出log
   console.log({ops, errors});
@@ -218,9 +229,10 @@ export function parseEditOps(raw: string): { ops: EditOp[]; errors: string[] } {
  * 把 ops 应用到 baseContent，得到新的完整文档。
  *
  * 应用规则（按文档顺序）：
- * - 任意 op 是 REPLACE_ALL → **完全覆盖** baseContent（后续 SEARCH/REPLACE 不再生效）
+ * - 任意 op 是 REPLACE_ALL → **完全覆盖** baseContent（后续 SEARCH/REPLACE/APPEND 不再生效）
  * - SEARCH/REPLACE：在 baseContent 里查找 search 子串，**唯一匹配**则替换为 replace；
  *   不唯一 / 找不到 → 跳过该 op + 收集到 warnings，不抛错
+ * - APPEND：直接追加到当前 result 末尾（与 SEARCH/REPLACE 顺序应用，APPEND 在最后追加）
  *
  * 返回 warnings 让 UI 可以提示用户"3 个块未能匹配"，让用户决定是接受部分改动还是 reject 全部。
  */
@@ -235,7 +247,7 @@ export function applyOps(
       return { result: op.content, warnings }
     }
   }
-  // SEARCH/REPLACE：顺序应用
+  // SEARCH/REPLACE + APPEND：顺序应用（APPEND 是无锚点追加，不会失败）
   let result = base
   for (const op of ops) {
     if (op.type === 'search_replace') {
@@ -252,6 +264,9 @@ export function applyOps(
       }
       result =
         result.slice(0, idx) + op.replace + result.slice(idx + op.search.length)
+    } else if (op.type === 'append') {
+      // 无锚点追加：直接拼到末尾。需要前面有换行 → AI 自己加 \n
+      result = result + op.content
     }
   }
   return { result, warnings }
@@ -1170,10 +1185,9 @@ export const useDocumentStore = defineStore('document', () => {
       }
       // op 解析错误（如 REPLACE_ALL 出现多次）→ toast 提示用户，让用户知道部分 op 没生效
       if (capturedOpErrors.length > 0) {
-        // 用 console.warn 兜底；UI 上原本就有 pendingDiff 显示，应用失败的细节已经写在
-        // pendingDiff.opWarnings 里（applyOps 返回），这里只把后端的"协议级"错误打出来
         console.warn('[generate] op parse errors:', capturedOpErrors)
       }
+
       streamingPreview.value = null
       // edit 模式下 user/AI 消息不在这里加，等用户点"接受"再追加（拒绝则整个一轮都不算）
       return { content: cleanedContent, mode: 'edit' }

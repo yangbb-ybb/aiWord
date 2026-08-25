@@ -97,6 +97,11 @@ function buildSystem(opts: {
     '替换后的新内容',
     '<<<END>>>',
     '',
+    '末尾追加内容（最常用）→ 用 APPEND（不需要锚点，避免拼接易碎的 SEARCH anchor）：',
+    '<<<APPEND>>>',
+    '要追加的内容（前面如需换行 → 自己加 \n）',
+    '<<<END>>>',
+    '',
     '整篇重写/从头起草 → 用 REPLACE_ALL（一份覆盖整个文档）：',
     '<<<REPLACE_ALL>>>',
     '完整的新文档内容',
@@ -104,8 +109,9 @@ function buildSystem(opts: {
     '',
     '规则：',
     '- SEARCH 锚点必须在文档里**唯一**出现（不唯一就重写得更具体、加上下文行）',
-    '- REPLACE_ALL 只能 0 或 1 次；一旦出现就完全替换文档，SEARCH/REPLACE 不再生效',
-    '- 多个独立改动 → 多个 SEARCH/REPLACE 块，按文档顺序排列（先出现的替换先执行）',
+    '- APPEND 追加到文档末尾；不要 append 重复的内容（基于当前文档决定）',
+    '- REPLACE_ALL 只能 0 或 1 次；一旦出现就完全替换文档，SEARCH/REPLACE/APPEND 不再生效',
+    '- 多个独立改动 → 多个 SEARCH/REPLACE 块，按文档顺序排列（先出现的替换先执行）；APPEND 在所有 SEARCH/REPLACE 之后执行',
     '- 不要在正文里出现任何 markdown 围栏（```...```）；不要"以下是…"元评论',
     '',
     '═══ analyze/chat 模式 ═══',
@@ -142,6 +148,7 @@ export type StreamMeta = {
 export type EditOp =
   | { type: 'search_replace'; search: string; replace: string }
   | { type: 'replace_all'; content: string }
+  | { type: 'append'; content: string }
 
 export interface ParseEditOpsResult {
   ops: EditOp[]
@@ -177,9 +184,10 @@ export function parseEditOps(raw: string): ParseEditOpsResult {
 
   // 第一步：用宽松正则匹配完整的 op 块（start marker → end marker）
   // 对标记前后的换行/空格不做任何要求，只要 start/end 标记成对出现即可
-  const BLOCK_RE = /<<<(SEARCH|REPLACE_ALL)>>>([\s\S]*?)<<<END>>>/g
+  const BLOCK_RE = /<<<(SEARCH|REPLACE_ALL|APPEND)>>>([\s\S]*?)<<<END>>>/g
   let m: RegExpExecArray | null
   let replaceAllCount = 0
+  let appendCount = 0
   while ((m = BLOCK_RE.exec(text)) !== null) {
     const kind = m[1]
     const body = m[2]
@@ -187,6 +195,12 @@ export function parseEditOps(raw: string): ParseEditOpsResult {
       // 去掉首尾的换行（标记行单独成行时 block 体两端各有一个 \n）
       ops.push({ type: 'replace_all', content: body.replace(/^\n/, '').replace(/\n$/, '') })
       replaceAllCount++
+    } else if (kind === 'APPEND') {
+      ops.push({
+        type: 'append',
+        content: body.replace(/^\n+/, '').replace(/\n+$/, '')
+      })
+      appendCount++
     } else {
       // SEARCH 块：在 body 内找 >>>REPLACE>>> 标记分隔 search / replace
       // 不要求严格换行（容错），用 indexOf 直接切
@@ -207,6 +221,9 @@ export function parseEditOps(raw: string): ParseEditOpsResult {
 
   if (replaceAllCount > 1) {
     errors.push(`REPLACE_ALL 出现 ${replaceAllCount} 次，只能 0 或 1 次`)
+  }
+  if (appendCount > 1) {
+    errors.push(`APPEND 出现 ${appendCount} 次，只能 0 或 1 次`)
   }
 
   return { ops, errors }

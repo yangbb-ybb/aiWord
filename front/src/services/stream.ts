@@ -45,6 +45,7 @@ export interface StreamDoneEvent {
 export type EditOp =
   | { type: 'search_replace'; search: string; replace: string }
   | { type: 'replace_all'; content: string }
+  | { type: 'append'; content: string }
 
 export interface StreamErrorEvent {
   message: string

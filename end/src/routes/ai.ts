@@ -105,7 +105,11 @@ async function streamAi(
     cacheRead?: number
     cacheWrite?: number
     /** edit 模式解析后的 op 数组；chat/analyze 模式为空数组 */
-    ops?: Array<{ type: 'search_replace'; search: string; replace: string } | { type: 'replace_all'; content: string }>
+    ops?: Array<
+      | { type: 'search_replace'; search: string; replace: string }
+      | { type: 'replace_all'; content: string }
+      | { type: 'append'; content: string }
+    >
     /** parseEditOps 诊断信息（REPLACE_ALL 多次等） */
     opErrors?: string[]
   }>
