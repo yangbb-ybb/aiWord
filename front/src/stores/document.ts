@@ -162,25 +162,14 @@ function sanitizeAiBody(text: string): string {
  * ────────────────────────────────────────────────────────────────── */
 
 /**
- * 把 AI 流式文本里的 `<<<SEARCH>>>` / `>>>REPLACE>>>` / `<<<REPLACE_ALL>>>` /
- * `<<<END>>>` 标记行去掉，返回"标记剥光后的纯文本"。
- *
- * 用于 edit 模式流式预览期间：用户看到的是剥光标记后的中间状态（而不是原始 op 流），
- * 否则用户会看到 `<<<SEARCH>>>` 这种奇怪的指令。
- *
- * 不做语义校验（只看是不是独立一行），可能误伤文档里恰好长这样的文本，但概率极低
- * （4 个尖括号模式本身就很独特），且只在 edit 流式预览期间显示，不影响最终落库结果。
- */
-function stripOpMarkers(text: string): string {
-  return text
-    .replace(/^\s*<<<SEARCH>>>\s*\n?/gm, '')
-    .replace(/^\s*>>>REPLACE>>>\s*\n?/gm, '')
-    .replace(/^\s*<<<REPLACE_ALL>>>\s*\n?/gm, '')
-    .replace(/^\s*<<<END>>>\s*\n?/gm, '')
-}
-
-/**
  * 从 AI 原始回复里解析 SEARCH/REPLACE + REPLACE_ALL op 块。
+ *
+ * 历史教训（2026-08-25）：早期版本要求严格换行边界 `<<<END>>>\s*\n?`，
+ * AI 输出常出现 `我是测试001<<<END>>>`（无前导换行）的格式，正则匹配失败，
+ * 前端 fallback 到 raw 文本做 diff，导致"原文全删、新增 op 标记"的诡异 diff。
+ *
+ * 现在改成：先宽松匹配整个 op 块（start marker → end marker），
+ * 再在 body 内用 indexOf('>>>REPLACE>>>') 切分 search/replace。
  *
  * 返回的 ops 即使只有部分完整块也能被前端利用（每个 op 是独立的，应用一次成功一次）；
  * 应用失败（SEARCH 锚点不唯一 / 找不到）会被 applyOps() 收集到 warnings 而非抛错，
@@ -189,17 +178,31 @@ function stripOpMarkers(text: string): string {
 export function parseEditOps(raw: string): { ops: EditOp[]; errors: string[] } {
   const ops: EditOp[] = []
   const errors: string[] = []
-  // 与后端 parseEditOps 同语义，但前端只信任自己解析出来的（万一后端漏字段）
-  const RE =
-    /<<<SEARCH>>>\s*\n([\s\S]*?)\n>>>REPLACE>>>\s*\n([\s\S]*?)\n<<<END>>>\s*\n?|<<<REPLACE_ALL>>>\s*\n([\s\S]*?)\n<<<END>>>\s*\n?/g
+  // 宽松匹配整个 op 块（start marker → end marker），对换行/空格容错。
+  // 之前严格要求 `\n<<<END>>>\s*\n?` 这种边界，AI 输出 `我是测试001<<<END>>>` 这种
+  // 没前导换行的格式就匹配不上，fallback 到 raw 文本做 diff 会出现"原文全删"的诡异 UI。
+  const BLOCK_RE = /<<<(SEARCH|REPLACE_ALL)>>>([\s\S]*?)<<<END>>>/g
   let m: RegExpExecArray | null
   let replaceAllCount = 0
-  while ((m = RE.exec(raw)) !== null) {
-    if (m[1] !== undefined && m[2] !== undefined) {
-      ops.push({ type: 'search_replace', search: m[1], replace: m[2] })
-    } else if (m[3] !== undefined) {
-      ops.push({ type: 'replace_all', content: m[3] })
+  while ((m = BLOCK_RE.exec(raw)) !== null) {
+    const kind = m[1]
+    const body = m[2]
+    if (kind === 'REPLACE_ALL') {
+      ops.push({
+        type: 'replace_all',
+        content: body.replace(/^\n+/, '').replace(/\n+$/, '')
+      })
       replaceAllCount++
+    } else {
+      // SEARCH 块：在 body 内用 indexOf 切 search / replace（不要求严格换行）
+      const splitIdx = body.indexOf('>>>REPLACE>>>')
+      if (splitIdx === -1) {
+        errors.push('SEARCH 块缺 >>>REPLACE>>> 标记')
+        continue
+      }
+      const search = body.slice(0, splitIdx).replace(/^\n+/, '')
+      const replace = body.slice(splitIdx + '>>>REPLACE>>>'.length).replace(/\n+$/, '')
+      ops.push({ type: 'search_replace', search, replace })
     }
   }
   if (replaceAllCount > 1) {
@@ -1030,7 +1033,7 @@ export const useDocumentStore = defineStore('document', () => {
         ops = overrideOps
         warnings = r.warnings
       } else {
-        // 流式过程中：本地解析已完成 op；没有就退到剥光标记的中间状态
+        // 流式过程中：本地解析已完成 op
         const parsed = parseEditOps(contentBuffer)
         if (parsed.ops.length > 0) {
           const r = applyOps(baseContent, parsed.ops)
@@ -1038,9 +1041,12 @@ export const useDocumentStore = defineStore('document', () => {
           ops = parsed.ops
           warnings = r.warnings
         } else {
-          postContent = stripOpMarkers(sanitizeAiBody(contentBuffer))
+          // 解析失败（AI 输出格式异常 / 还在写第一个 op 中间）。
+          // ⚠️ 不要把 raw AI 文本当 postContent —— diff 对比后会出现"原文全删、新增一堆乱文本"。
+          // 用 baseContent 兜底（等价于"无改动"），UI 显示无 diff，配合下面的 warning 让用户 reject。
+          postContent = baseContent
           ops = []
-          warnings = []
+          warnings = parsed.errors.length > 0 ? parsed.errors : ['AI 输出尚未完成或格式无法识别']
         }
       }
       const diffParts = diffLines(baseContent, postContent)

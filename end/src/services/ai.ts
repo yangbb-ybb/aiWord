@@ -151,14 +151,20 @@ export interface ParseEditOpsResult {
 /**
  * 从 AI [CONTENT] 之后的正文里解析 op 块。
  *
- * 容忍：
- * - search/replace 内容里可能有空行、特殊字符（不含 `<<<END>>>` 行本身）
+ * 容忍（之前版本太严格，被实际场景坑过——见下面注释）：
+ * - 标记行与内容之间允许任意空白/换行（甚至挤在一行也行）
+ * - search/replace 内容里可能有空行、特殊字符（不含 `<<<END>>>` 标记本身）
  * - 多个 SEARCH/REPLACE 块按文档顺序返回
  * - REPLACE_ALL 块只能出现 0 或 1 次
  *
  * 不容忍 / 算 errors：
  * - op 块没有正确闭合（start/end 不匹配）
  * - REPLACE_ALL 出现 > 1 次
+ *
+ * 历史教训（2026-08-25）：早期版本要求 `\n<<<END>>>\s*\n?` 这种精确换行边界，
+ * 但 AI 输出常在 `我是测试001<<<END>>>` 这种**没有前导换行**的情况，正则匹配失败，
+ * 整段 op 没解析出来，前端 fallback 把 AI 原文当 postContent 做 diff，
+ * 用户看到"原文全被删、新增了一堆标记文本"的诡异结果。
  *
  * 返回的 ops 即使有 errors 也尽量可用——前端 apply 时再做二次校验。
  */
@@ -169,22 +175,33 @@ export function parseEditOps(raw: string): ParseEditOpsResult {
   // 先剥掉 [INTENT]/[ASK]/[CONTENT] 等协议头（如果 AI 把它们也吐进正文了）
   const text = raw.replace(PROTOCOL_INLINE_RE, '')
 
-  // 一次性正则：要么匹配 SEARCH/REPLACE 块，要么匹配 REPLACE_ALL 块
-  // 内容捕获用非贪婪，遇到下一行的 <<<END>>> 才停
-  const RE = /<<<SEARCH>>>\s*\n([\s\S]*?)\n>>>REPLACE>>>\s*\n([\s\S]*?)\n<<<END>>>\s*\n?|<<<REPLACE_ALL>>>\s*\n([\s\S]*?)\n<<<END>>>\s*\n?/g
-
+  // 第一步：用宽松正则匹配完整的 op 块（start marker → end marker）
+  // 对标记前后的换行/空格不做任何要求，只要 start/end 标记成对出现即可
+  const BLOCK_RE = /<<<(SEARCH|REPLACE_ALL)>>>([\s\S]*?)<<<END>>>/g
   let m: RegExpExecArray | null
   let replaceAllCount = 0
-  while ((m = RE.exec(text)) !== null) {
-    if (m[1] !== undefined && m[2] !== undefined) {
-      ops.push({
-        type: 'search_replace',
-        search: m[1],
-        replace: m[2]
-      })
-    } else if (m[3] !== undefined) {
-      ops.push({ type: 'replace_all', content: m[3] })
+  while ((m = BLOCK_RE.exec(text)) !== null) {
+    const kind = m[1]
+    const body = m[2]
+    if (kind === 'REPLACE_ALL') {
+      // 去掉首尾的换行（标记行单独成行时 block 体两端各有一个 \n）
+      ops.push({ type: 'replace_all', content: body.replace(/^\n/, '').replace(/\n$/, '') })
       replaceAllCount++
+    } else {
+      // SEARCH 块：在 body 内找 >>>REPLACE>>> 标记分隔 search / replace
+      // 不要求严格换行（容错），用 indexOf 直接切
+      const splitIdx = body.indexOf('>>>REPLACE>>>')
+      if (splitIdx === -1) {
+        errors.push('SEARCH 块缺 >>>REPLACE>>> 标记')
+        continue
+      }
+      // 剥掉 search/replace 各自的"首尾紧贴标记的换行"——
+      // 标准格式是 `<<<SEARCH>>>\nfoo\n>>>REPLACE>>>\nbar\n<<<END>>>`，
+      // body 在 `<<<SEARCH>>>` 和 `<<<END>>>` 之间是 `\nfoo\n>>>REPLACE>>>\nbar\n`，
+      // 切分后两端各有 \n，剥掉得到 `foo` 和 `bar`。但保留内部换行（多行 search 关键）。
+      const search = body.slice(0, splitIdx).replace(/^\n+/, '')
+      const replace = body.slice(splitIdx + '>>>REPLACE>>>'.length).replace(/\n+$/, '')
+      ops.push({ type: 'search_replace', search, replace })
     }
   }
 
