@@ -368,9 +368,13 @@ async function handleChoice(choice: ChatChoice) {
     }
   }
   // 2) 合成明确指令：原问题 + 用户的选择
+  // ⚠️ 不要用"请继续"——后端 system prompt 把"继续"列为 edit 触发关键词,
+  // AI 看到"继续"会切到 edit 模式,但又不知道要改文档哪部分,于是又 ASK=choice 问"你想改哪部分",
+  // 弹窗再次弹出 → 死循环。
+  // 用"已确定"+ 显式禁止再列选项,让 AI 直接继续聊天,不再走 choice 协议。
   const composed = userPrompt
-    ? `针对问题"${userPrompt}"，我选「${choice.label}」：${choice.description}。请继续。`
-    : `我选「${choice.label}」：${choice.description}。请继续。`
+    ? `用户已确定选择「${choice.label}」：${choice.description}。原问题："${userPrompt}"。请直接按用户已选的方向继续讨论,不要再用 A/B/C/D 选项询问。`
+    : `用户已确定选择「${choice.label}」：${choice.description}。请直接按用户已选的方向继续讨论,不要再用 A/B/C/D 选项询问。`
 
   try {
     await store.generate({
