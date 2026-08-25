@@ -7,9 +7,10 @@ import type { AIProvider } from './types'
  * 实际由 env.MINIMAX_MODEL 决定发给 minimax 的模型名。
  */
 const MINIMAX_MODELS = [
-  { id: 'claude-sonnet', label: 'minimax · Sonnet（推荐）' },
-  { id: 'claude-haiku', label: 'minimax · Haiku（更快）' },
-  { id: 'claude-opus', label: 'minimax · Opus（更强）' }
+  { id: 'claude-sonnet', label: 'minimax' },
+  // { id: 'claude-sonnet', label: 'minimax · Sonnet（推荐）' },
+  // { id: 'claude-haiku', label: 'minimax · Haiku（更快）' },
+  // { id: 'claude-opus', label: 'minimax · Opus（更强）' }
 ]
 
 const ANTHROPIC_MODELS = [
