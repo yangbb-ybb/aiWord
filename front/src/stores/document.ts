@@ -903,7 +903,8 @@ export const useDocumentStore = defineStore('document', () => {
 
     // 立即把 user 气泡塞进 chatThread —— 流式过程中右栏也要看到自己刚发的消息，
     // 否则用户会以为没发出去。AI 气泡流结束后由 recordConversation / acceptPendingDiff 补上。
-    // edit 模式如果被 reject，rejectPendingDiff 会把这条 user 气泡回滚掉（保持"拒绝不留痕"语义）。
+    // edit 模式：accept 把 AI 改动写进 chatThread（kind='edit'）；reject 把 user 气泡保留 +
+    //   追加一条 "[已拒绝]" 摘要,让拒绝留下可见痕迹(给用户)和 AI 可见痕迹(给后续对话用)。
     const userMsgId = `u-${Date.now()}`
     {
       const next = new Map(chatThread.value)
@@ -1252,28 +1253,59 @@ export const useDocumentStore = defineStore('document', () => {
   /**
    * 拒绝 AI 改动：
    * - 文档保持 preContent 不变
-   * - 不入 chatHistory / chatThread（相当于这一轮白聊了，符合用户预期）
+   * - **保留 user 气泡**（让用户看到自己刚才问了什么）
+   * - 在 chatThread 追加一条 assistant "[已拒绝]" 摘要气泡（含 opWarnings,如果有）,
+   *   让用户在右栏看到拒绝发生了 + 知道哪些 op 没生效
+   * - chatHistory 里完整记录 user prompt + assistant 输出 + 一条 user "我拒了"的反馈,
+   *   让 AI 在后续会话中能看到"这条建议被拒过",避免重复同样的方向
    */
   function rejectPendingDiff(): boolean {
     if (!pendingDiff.value) return false
     const pd = pendingDiff.value
+    const docId = pd.docId
     pendingDiff.value = null
     streamingPreview.value = null
-    // 回滚 generate() 开始时塞进 chatThread 的 user 气泡（保持"拒绝不留痕"语义）
-    // 只动 pd.docId 这条 doc 的 chatThread，避免误伤其他 doc
-    const thread = chatThread.value.get(pd.docId)
-    if (thread && thread.length > 0) {
-      const next = new Map(chatThread.value)
-      // 从末尾往前找最近的 user 气泡；正常情况就是最后一条
-      const idx = [...thread].reverse().findIndex((m) => m.role === 'user')
-      if (idx >= 0) {
-        const realIdx = thread.length - 1 - idx
-        const newList = thread.slice(0, realIdx)
-        if (newList.length === 0) next.delete(pd.docId)
-        else next.set(pd.docId, newList)
-        chatThread.value = next
-      }
-    }
+
+    // 1) chatThread：保留 user 气泡不动，追加一条 assistant "[已拒绝]" 摘要
+    //    - 用 kind='chat' 走普通气泡渲染（markdown 友好）
+    //    - 如果 opWarnings 非空，把诊断信息也展示出来（"部分块没匹配上"）
+    const summary =
+      pd.opWarnings.length > 0
+        ? `🚫 **已拒绝本次 AI 改动**（文档未变更）\n\n部分操作未匹配：\n${pd.opWarnings.map((w) => `- ${w}`).join('\n')}`
+        : '🚫 **已拒绝本次 AI 改动**（文档未变更）'
+    const threadNext = new Map(chatThread.value)
+    const threadList = [...(threadNext.get(docId) ?? [])]
+    threadList.push({
+      id: `rej-${Date.now()}`,
+      role: 'assistant',
+      content: summary,
+      kind: 'chat',
+      ts: Date.now()
+    })
+    threadNext.set(docId, threadList)
+    chatThread.value = threadNext
+
+    // 2) chatHistory：喂回 AI 用的"对话历史"
+    //    - user prompt + assistant 的完整新文档(postContent,不是 raw AI 文本)
+    //    - 关键的回馈：用 user 角色告诉 AI "用户拒绝了这条建议",
+    //      AI 下次看到这条历史就知道方向不对,会主动避开或换思路
+    const histNext = new Map(chatHistory.value)
+    const histList = [...(histNext.get(docId) ?? [])]
+    histList.push({ role: 'user', content: pd.prompt })
+    histList.push({
+      role: 'assistant',
+      content: pd.postContent,
+      kind: 'edit',
+      ask: 'none'
+    })
+    histList.push({
+      role: 'user',
+      // 中文/英文都行;简洁地告诉 AI 这条建议被拒过
+      content: `[用户拒绝了上述 AI 的修改建议]${pd.opWarnings.length > 0 ? `（未匹配：${pd.opWarnings.join('; ')}）` : ''}`
+    })
+    histNext.set(docId, histList.slice(-20))
+    chatHistory.value = histNext
+
     return true
   }
 

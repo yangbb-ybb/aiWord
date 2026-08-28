@@ -1,0 +1,36 @@
+# 依赖
+node_modules
+.pnpm-store
+
+# 构建产物
+dist
+dist-ssr
+*.local
+
+# 日志
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 编辑器
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 自动生成(unplugin)
+src/auto-imports.d.ts
+src/components.d.ts
+
+# 环境变量
+.env
+.env.local
+.env.*.local

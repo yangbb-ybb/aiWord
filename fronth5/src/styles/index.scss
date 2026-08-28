@@ -1,0 +1,27 @@
+/**
+ * 全局样式：
+ * - 主题色：跟桌面端 front 的 brand 色对齐 (#4f46e5)
+ * - 重置 html/body margin/padding
+ * - box-sizing 全局 border-box
+ *
+ * 字号/间距等细节由 Vant 4 的 CSS 变量（--van-*）和组件自带规范统一管理，
+ * 避免在业务代码里硬编码 px。postcss-px-to-viewport 会自动把 px 转 vw。
+ */
+:root {
+  --van-primary-color: #4f46e5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  // Vant 推荐的字体栈
+  font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Helvetica, Segoe UI,
+    Arial, Roboto, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
