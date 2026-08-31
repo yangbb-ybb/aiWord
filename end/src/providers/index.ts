@@ -1,5 +1,10 @@
 import { env, pickAiProvider } from '~/config/env'
 import { createClaudeProvider } from './claude'
+import {
+  createMinimaxImageProvider,
+  ensureImageApiKey,
+  type ImageProvider
+} from './image'
 import type { AIProvider } from './types'
 
 /**
@@ -76,6 +81,33 @@ export function getProvider(): AIProvider {
  */
 export function resolveModel(modelId: string): string {
   return modelId || env.MINIMAX_MODEL
+}
+
+// =====================================================================
+// Image Provider（独立于 AIProvider —— image 是阻塞式 REST，没有流式增量）
+// =====================================================================
+
+let cachedImageProvider: ImageProvider | null = null
+
+/**
+ * 单例 image provider。同 account 共用 MINIMAX_API_KEY，复用现有 key 解析。
+ * 如果没配 key 就抛 AppError(503)，由 route 层 ensureImageAvailable 转响应。
+ */
+export function getImageProvider(): ImageProvider {
+  if (cachedImageProvider) return cachedImageProvider
+  const apiKey = ensureImageApiKey()
+  cachedImageProvider = createMinimaxImageProvider({
+    apiKey,
+    baseURL: env.MINIMAX_IMAGE_BASE_URL,
+    model: env.MINIMAX_IMAGE_MODEL,
+    timeoutMs: env.IMAGE_TIMEOUT_MS
+  })
+  return cachedImageProvider
+}
+
+/** 前端下拉的 image model id → 实际 model name */
+export function resolveImageModel(modelId: string): string {
+  return modelId || env.MINIMAX_IMAGE_MODEL
 }
 
 export type { AIProvider } from './types'

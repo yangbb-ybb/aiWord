@@ -24,6 +24,17 @@ const schema = z.object({
     .default('https://api.minimaxi.com/anthropic'),
   MINIMAX_MODEL: z.string().default('claude-sonnet-4-5'),
 
+  // minimax image-01(走 /v1/image_generation,跟 LLM 同一个 API key)
+  MINIMAX_IMAGE_BASE_URL: z
+    .string()
+    .default('https://api.minimaxi.com'),
+  MINIMAX_IMAGE_MODEL: z.string().default('image-01'),
+  // image-01 高峰期可能 60-90s,留 120s 兜底;再慢就放弃给用户友好提示
+  // (从日志看高峰期 45s 拿到 → 60s 拿到 → 60s 超时,高峰期继续放长)
+  IMAGE_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  // LLM 文字流式:超过这个时间还没吐完就 abort,避免 image 失败时 total 等太久
+  LLM_TIMEOUT_MS: z.coerce.number().int().positive().default(90_000),
+
   // 官方 Anthropic 作为兜底
   ANTHROPIC_API_KEY: z.string().optional(),
   ANTHROPIC_BASE_URL: z.string().default('https://api.anthropic.com'),
