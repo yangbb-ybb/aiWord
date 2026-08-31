@@ -12,11 +12,33 @@ export interface SystemMessage {
   content: string
 }
 
+/**
+ * 单条消息的块。
+ *  - text 块携带纯文本(支持 cache_control)
+ *  - image 块走 base64 或 URL，目前主要用 url 形式(从上游 CDN 拿到图直接喂)
+ *
+ * 多模态消息(如"AI 之前画过的图")用数组形式：[{type:'image',...},{type:'text',...}]。
+ */
+export type ContentBlock =
+  | {
+      type: 'text'
+      text: string
+      /** 命中 cache 只收 10% token 价；TTL 默认 5 分钟 */
+      cache_control?: { type: 'ephemeral' }
+    }
+  | {
+      type: 'image'
+      source:
+        | { type: 'url'; data: string }
+        | { type: 'base64'; media_type: string; data: string }
+    }
+
 export interface Message {
   role: Role
-  content: string
+  /** 文本消息时用 string；多模态（带图）时用 ContentBlock[] */
+  content: string | ContentBlock[]
   /**
-   * 标记这条消息为 Anthropic prompt cache breakpoint。
+   * 标记这条消息为 Anthropic prompt cache breakpoint（仅对 text block 生效）。
    * 命中时 cache read 只收 10% input token 价；cache TTL 默认 5 分钟。
    * 只在 anthropic / 兼容协议的 provider 里生效；minimax 支持的话同代码直接享受。
    */

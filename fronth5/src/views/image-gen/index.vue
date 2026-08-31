@@ -92,9 +92,35 @@ function pickExample(text: string) {
   prompt.value = text
 }
 
+/**
+ * 从 messages 里抽出"已完成的对话轮次"作为 history 发给后端,让 LLM 能延续上文。
+ *  - 过滤掉 loading 中、失败标记(以"(图片生成失败)"结尾)的轮次 —— 这些不该污染上下文
+ *  - 只取最近 6 条(约 3 轮对话),避免 prompt 过长
+ *  - 只取有 text 的轮次(空文本可能是 ai 加载中)
+ */
+function buildHistory() {
+  return messages.value
+    .filter(
+      (m) =>
+        !m.loading &&
+        m.text &&
+        !m.text.endsWith('(图片生成失败)') &&
+        m.text !== '生成失败,请重试'
+    )
+    .slice(-6)
+    .map((m) => ({
+      role: (m.role === 'user' ? 'user' : 'ai') as 'user' | 'ai',
+      text: m.text,
+      // ai 轮且成功出图才有 imageUrl;后端会把它作为 image block 给 LLM 看
+      imageUrl: m.role === 'ai' ? m.imageUrl : undefined
+    }))
+}
+
 async function send() {
   if (!canSend.value) return
   const userText = prompt.value.trim()
+  // 抓取当前消息列表的快照作为 history —— 在 push 当前 user/ai 之前
+  const history = buildHistory()
   messages.value.push({
     id: `u-${Date.now()}`,
     role: 'user',
@@ -120,7 +146,7 @@ async function send() {
 
   try {
     await chatImage(
-      { prompt: userText, style: style.value },
+      { prompt: userText, style: style.value, history },
       {
         onChunk: (chunk) => {
           // 流式把 AI 文字累加到 aiMsg.text,用户看到"AI 正在打字"

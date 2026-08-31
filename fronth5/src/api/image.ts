@@ -14,9 +14,27 @@ import { api } from './index'
 
 export type ImageStyle = 'realistic' | 'illustration' | 'watercolor' | '3d'
 
+/**
+ * 多轮对话的历史回合(不含当前这条 user 请求)。
+ *  - role: 'user' 来自用户输入
+ *  - role: 'ai' 来自 AI 上一轮回复
+ *  - imageUrl: 仅 ai 轮且成功出图时存在;后端会把它作为 image block 喂给 LLM,
+ *    让 LLM 多模态看到上一张图,延续/修改/重画时构图更连贯
+ */
+export interface HistoryTurn {
+  role: 'user' | 'ai'
+  text: string
+  imageUrl?: string
+}
+
 export interface ImageChatRequest {
   prompt: string
   style?: ImageStyle
+  /**
+   * 之前几轮对话历史,后端会拼进 LLM messages;失败轮次(无 imageUrl 或标记失败)
+   * 不传,避免污染上下文。
+   */
+  history?: HistoryTurn[]
 }
 
 /**
@@ -79,7 +97,11 @@ export async function chatImage(
         'Content-Type': 'application/json',
         Accept: 'text/event-stream'
       },
-      body: JSON.stringify({ prompt: req.prompt, style: req.style ?? 'realistic' })
+      body: JSON.stringify({
+        prompt: req.prompt,
+        style: req.style ?? 'realistic',
+        history: req.history ?? []
+      })
     })
   } catch (err) {
     handlers.onError?.(err instanceof Error ? err : new Error(String(err)))

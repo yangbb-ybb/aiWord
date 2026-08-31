@@ -87,15 +87,19 @@ function createDailyFileStream(logDir: string, baseName: string): SonicBoom {
  * 末尾 `Z` 是 UTC 标记。国内看日志要 +8 小时换算，容易误判"夜间请求"。
  * 这里直接吐出 `2026-08-31T15:22:41.262+08:00`，肉眼即读。
  *
- * 注意：daily rotation 的本地日期逻辑(getFullYear/getMonth/getDate)保持不变，
- * 这俩本来就是本地时间，所以跨天切分不会受影响。
+ * **重要**:pino 的 timestamp 必须返回**带 `,"time":"..."` 前缀**的字符串,
+ * pino 内部把它拼接到 `{"level":"..."` 后面。所以返回纯 ISO 串会让 JSON 残缺。
+ * 参考 pino.stdTimeFunctions.isoTime 实现:
+ *   () => `,"time":"${new Date().toISOString()}"`
+ *
+ * 注意:daily rotation 的本地日期逻辑(getFullYear/getMonth/getDate)保持不变,
+ * 这俩本来就是本地时间,所以跨天切分不会受影响。
  */
 function beijingIsoTime(): string {
   const now = new Date()
-  // 把 UTC 时间拨到东八区，再格式化掉时区标记
+  // 把 UTC 时间拨到东八区,再格式化掉时区标记
   const beijing = new Date(now.getTime() + 8 * 60 * 60 * 1000)
-  // toISOString 永远返回 `...Z`,我们替换 Z 为 `+08:00`
-  return beijing.toISOString().replace('Z', '+08:00')
+  return `,"time":"${beijing.toISOString().replace('Z', '+08:00')}"`
 }
 
 /** 构造 pino 实例。Fastify 启动时通过 logger 选项接收（pino 自身就是 FastifyBaseLogger）。 */
