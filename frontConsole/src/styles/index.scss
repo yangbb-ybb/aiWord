@@ -1,0 +1,40 @@
+/**
+ * 全局样式 —— 跟 fronth5 共享色调但走桌面端布局。
+ */
+
+:root {
+  --console-primary: #409eff;
+  --console-bg: #f0f2f5;
+  --console-border: #e4e7ed;
+  --console-text: #303133;
+}
+
+body {
+  background: var(--console-bg);
+  color: var(--console-text);
+}
+
+/* 滚动条美化(webkit 内核) */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* 通用工具类 */
+.flex { display: flex; }
+.flex-1 { flex: 1; }
+.flex-col { flex-direction: column; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.gap-8 { gap: 8px; }
+.gap-16 { gap: 16px; }
+.mt-8 { margin-top: 8px; }
+.mt-16 { margin-top: 16px; }
+.mb-16 { margin-bottom: 16px; }

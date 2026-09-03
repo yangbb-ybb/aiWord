@@ -1,0 +1,19 @@
+node_modules
+dist
+dist-ssr
+*.local
+
+# editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 自动生成的类型
+src/auto-imports.d.ts
+src/components.d.ts

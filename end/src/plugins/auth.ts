@@ -61,11 +61,33 @@ export async function registerAuthPlugin(app: FastifyInstance) {
       req.log = req.log.child({ userId: req.user.id })
     }
   )
+
+  /**
+   * 管理员校验：先走 authRequired，再确认 role === 'admin'。
+   * 用法: `{ preHandler: app.adminRequired }`
+   */
+  app.decorate(
+    'adminRequired',
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      // 复用 authRequired 的逻辑(包一层)
+      await app.authRequired(req, reply)
+      if (reply.sent) return // authRequired 已经返回 401/403,不要再往下走
+      if (!req.user || req.user.role !== 'admin') {
+        return reply
+          .code(403)
+          .send({ code: 'FORBIDDEN', errorCode: 'ADMIN_REQUIRED', message: '仅管理员可访问' })
+      }
+    }
+  )
 }
 
 declare module 'fastify' {
   interface FastifyInstance {
     authRequired: (
+      req: FastifyRequest,
+      reply: FastifyReply
+    ) => Promise<void>
+    adminRequired: (
       req: FastifyRequest,
       reply: FastifyReply
     ) => Promise<void>

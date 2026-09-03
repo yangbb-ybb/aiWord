@@ -11,6 +11,7 @@ import templatesRoutes from '~/routes/templates'
 import usersRoutes from '~/routes/users'
 import exportRoutes from '~/routes/export'
 import imageRoutes from '~/routes/image'
+import adminRoutes from '~/routes/admin'
 import { AppError, isDbError } from './services/errors'
 import { createLogger } from './utils/logger'
 
@@ -168,6 +169,7 @@ export async function buildApp() {
       await api.register(templatesRoutes, { prefix: '/templates' })
       await api.register(exportRoutes, { prefix: '/export' })
       await api.register(imageRoutes, { prefix: '/image' })
+      await api.register(adminRoutes, { prefix: '/admin' })
     },
     { prefix: '/api' }
   )
